@@ -57,7 +57,9 @@ cd -- "$repository_root"
 remote_branch="refs/remotes/origin/$default_branch"
 git show-ref --verify --quiet "$remote_branch" || \
   die "origin/$default_branch is not available in the local checkout"
-git cat-file --quiet --verify "$commit^{commit}" 2>/dev/null || \
+# `--verify` validates a revision expression in `git rev-parse`; `cat-file`
+# does not support that option for this check.
+git rev-parse --verify --quiet "$commit^{commit}" >/dev/null 2>&1 || \
   die "commit $commit is not available in the local checkout"
 git merge-base --is-ancestor "$commit" "$remote_branch" || \
   die "release tag $tag must point to a commit on $default_branch"
