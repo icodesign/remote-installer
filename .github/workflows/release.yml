@@ -119,11 +119,13 @@ jobs:
           VERSION: ${{ needs.preflight.outputs.version }}
           TARGET: ${{ matrix.target }}
           ARCH: ${{ matrix.arch }}
-        run: packaging/release/release-assets.sh package \
-          "target/${TARGET}/release/remote-installer" \
-          "$VERSION" \
-          "$ARCH" \
-          .
+        run: |
+          set -euo pipefail
+          packaging/release/release-assets.sh package \
+            "target/${TARGET}/release/remote-installer" \
+            "$VERSION" \
+            "$ARCH" \
+            .
 
       - name: Upload the architecture asset
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -218,10 +220,12 @@ jobs:
           printf 'tarball=%s\n' "$tarball" >> "$GITHUB_OUTPUT"
 
       - name: Publish the npm package
-        run: packaging/npm/release-package.sh publish \
-          "$NPM_PACKAGE_NAME" \
-          "$VERSION" \
-          "${{ steps.npm_package.outputs.tarball }}"
+        run: |
+          set -euo pipefail
+          packaging/npm/release-package.sh publish \
+            "$NPM_PACKAGE_NAME" \
+            "$VERSION" \
+            "${{ steps.npm_package.outputs.tarball }}"
 
   publish-release:
     needs: [preflight, stage-release, publish-npm]
