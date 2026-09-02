@@ -1,0 +1,24 @@
+class RemoteInstaller < Formula
+  desc "Share a signed iOS build over a temporary HTTPS tunnel"
+  homepage "@@HOMEPAGE@@"
+  version "@@VERSION@@"
+  depends_on :macos
+
+  if Hardware::CPU.arm?
+    url "@@RELEASE_BASE_URL@@/remote-installer-@@VERSION@@-darwin-arm64.tar.gz"
+    sha256 "@@ARM64_SHA256@@"
+  elsif Hardware::CPU.intel?
+    url "@@RELEASE_BASE_URL@@/remote-installer-@@VERSION@@-darwin-x86_64.tar.gz"
+    sha256 "@@X86_64_SHA256@@"
+  else
+    odie "remote-installer only provides macOS arm64 and x86_64 binaries"
+  end
+
+  def install
+    bin.install "remote-installer"
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/remote-installer --version")
+  end
+end

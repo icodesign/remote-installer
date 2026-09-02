@@ -1,0 +1,11 @@
+{
+  "$schema": "https://skills.sh/schemas/skills.sh.schema.json",
+  "notGrouped": "bottom",
+  "groupings": [
+    {
+      "title": "iOS distribution",
+      "description": "Getting builds onto real devices without TestFlight or a cable.",
+      "skills": ["share-ios-build"]
+    }
+  ]
+}

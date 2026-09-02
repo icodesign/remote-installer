@@ -1,0 +1,273 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+# These are release destinations, not guesses made by a packaging script. If
+# either destination changes, update this configuration and its credentials
+# before cutting the next tag.
+env:
+  NPM_PACKAGE_NAME: "@icodesign/remote-installer"
+  HOMEBREW_TAP_REPOSITORY: icodesign/homebrew-tap
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate the release version
+        id: version
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          version="$(packaging/release/validate-release.sh \
+            "$GITHUB_REF_NAME" \
+            "$DEFAULT_BRANCH" \
+            "$GITHUB_SHA")"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Require Homebrew credentials
+        shell: bash
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ -n "$HOMEBREW_TAP_TOKEN" ]] || {
+            echo "HOMEBREW_TAP_TOKEN repository secret is required before updating the tap" >&2
+            exit 1
+          }
+
+  verify:
+    needs: preflight
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust lint components
+        run: rustup component add clippy rustfmt
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Verify the tagged source
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --locked
+          node --check packaging/npm/bin/remote-installer.js
+          node --check packaging/npm/build-package.mjs
+          node -e 'JSON.parse(require("fs").readFileSync("packaging/npm/package.json.template", "utf8"))'
+          while IFS= read -r script; do
+            bash -n "$script"
+          done < <(find packaging -type f -name '*.sh' -print)
+
+  build:
+    needs: [preflight, verify]
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            arch: arm64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install the Rust target
+        run: rustup target add "${{ matrix.target }}"
+
+      - name: Build the release binary
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+
+      - name: Package and checksum the release asset
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+        run: packaging/release/release-assets.sh package \
+          "target/${TARGET}/release/remote-installer" \
+          "$VERSION" \
+          "$ARCH" \
+          .
+
+      - name: Upload the architecture asset
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.arch }}
+          path: |
+            remote-installer-${{ needs.preflight.outputs.version }}-darwin-${{ matrix.arch }}.tar.gz
+            remote-installer-${{ needs.preflight.outputs.version }}-darwin-${{ matrix.arch }}.tar.gz.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  stage-release:
+    needs: [preflight, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Download architecture assets
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: release-*
+          path: dist/assets
+          merge-multiple: true
+
+      - name: Create or refresh the draft GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: packaging/release/github-release.sh stage "$VERSION" dist/assets
+
+  publish-npm:
+    needs: [preflight, build, stage-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Require an OIDC-capable npm CLI
+        run: |
+          set -euo pipefail
+          npm_version="$(npm --version)"
+          node -e '
+            const [major, minor] = process.argv[1].split(".").map(Number);
+            if (major < 11 || (major === 11 && minor < 5)) {
+              throw new Error(`npm 11.5.1 or newer is required; received ${process.argv[1]}`);
+            }
+          ' "$npm_version"
+
+      - name: Download architecture assets
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: release-*
+          path: dist/assets
+          merge-multiple: true
+
+      - name: Verify and unpack architecture assets
+        run: packaging/release/release-assets.sh extract dist/assets "$VERSION" dist/binaries
+
+      - name: Build and inspect the npm package
+        id: npm_package
+        shell: bash
+        run: |
+          set -euo pipefail
+          tarball="$(packaging/npm/release-package.sh prepare \
+            "$VERSION" \
+            "dist/binaries/arm64/remote-installer" \
+            "dist/binaries/x86_64/remote-installer" \
+            dist/npm)"
+          printf 'tarball=%s\n' "$tarball" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the npm package
+        run: packaging/npm/release-package.sh publish \
+          "$NPM_PACKAGE_NAME" \
+          "$VERSION" \
+          "${{ steps.npm_package.outputs.tarball }}"
+
+  publish-release:
+    needs: [preflight, stage-release, publish-npm]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: packaging/release/github-release.sh publish "$VERSION"
+
+  update-homebrew:
+    needs: [preflight, publish-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      VERSION: ${{ needs.preflight.outputs.version }}
+      HOMEBREW_GITHUB_REPOSITORY: ${{ github.repository }}
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Download checksums
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: release-*
+          path: dist/assets
+          merge-multiple: true
+
+      - name: Update the Homebrew tap formula
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARM64_SHA256="$(awk '{ print $1 }' "dist/assets/remote-installer-${VERSION}-darwin-arm64.tar.gz.sha256")"
+          X86_64_SHA256="$(awk '{ print $1 }' "dist/assets/remote-installer-${VERSION}-darwin-x86_64.tar.gz.sha256")"
+          export ARM64_SHA256 X86_64_SHA256
+          packaging/homebrew/update-tap.sh

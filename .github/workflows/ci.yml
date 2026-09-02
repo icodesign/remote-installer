@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust lint components
+        run: rustup component add clippy rustfmt
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check Rust lint
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Run Rust tests
+        run: cargo test --locked
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Check JavaScript packaging scripts
+        run: |
+          set -euo pipefail
+          node --check packaging/npm/bin/remote-installer.js
+          node --check packaging/npm/build-package.mjs
+          node -e 'JSON.parse(require("fs").readFileSync("packaging/npm/package.json.template", "utf8"))'
+
+      - name: Check shell packaging scripts
+        run: |
+          set -euo pipefail
+          while IFS= read -r script; do
+            bash -n "$script"
+          done < <(find packaging -type f -name '*.sh' -print)
+          version="$(awk '
+            /^\[package\][[:space:]]*$/ { in_package = 1; next }
+            /^\[/ && in_package { exit }
+            in_package && $1 == "version" && $2 == "=" {
+              gsub(/"/, "", $3)
+              print $3
+              exit
+            }
+          ' Cargo.toml)"
+          formula="${RUNNER_TEMP}/remote-installer.rb"
+          VERSION="$version" \
+          ARM64_SHA256="$(printf '0%.0s' {1..64})" \
+          X86_64_SHA256="$(printf '1%.0s' {1..64})" \
+          HOMEBREW_GITHUB_REPOSITORY="${GITHUB_REPOSITORY}" \
+            packaging/homebrew/render-formula.sh "$formula"
+          ruby -c "$formula"
+
+      - name: Smoke-test the release and npm packages
+        env:
+          NPM_PACKAGE_NAME: "@icodesign/remote-installer"
+          NPM_CONFIG_CACHE: ${{ runner.temp }}/npm-cache
+        run: |
+          set -euo pipefail
+          cargo build --locked
+          version="$(target/debug/remote-installer --version | awk '{ print $2 }')"
+          asset_root="${RUNNER_TEMP}/release-assets"
+          binary_root="${RUNNER_TEMP}/release-binaries"
+          mkdir -p "$asset_root"
+          for arch in arm64 x86_64; do
+            packaging/release/release-assets.sh package \
+              target/debug/remote-installer \
+              "$version" \
+              "$arch" \
+              "$asset_root"
+          done
+          packaging/release/release-assets.sh verify "$asset_root" "$version"
+          packaging/release/release-assets.sh extract "$asset_root" "$version" "$binary_root"
+          package_root="${RUNNER_TEMP}/npm-package"
+          package_directory="$package_root/remote-installer"
+          tarball="$(packaging/npm/release-package.sh prepare \
+            "$version" \
+            "$binary_root/arm64/remote-installer" \
+            "$binary_root/x86_64/remote-installer" \
+            "$package_root")"
+          test -f "$tarball"
+          node "$package_directory/bin/remote-installer.js" --version

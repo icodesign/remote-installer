@@ -1,0 +1,22 @@
+{
+  "name": "@@NPM_PACKAGE_NAME@@",
+  "version": "@@VERSION@@",
+  "description": "Share a signed iOS build over a temporary HTTPS tunnel",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/icodesign/remote-installer.git"
+  },
+  "bin": {
+    "remote-installer": "bin/remote-installer.js"
+  },
+  "files": [
+    "bin",
+    "vendor"
+  ],
+  "engines": {
+    "node": ">=14"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org"
+  }
+}
