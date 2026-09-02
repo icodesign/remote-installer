@@ -1,6 +1,6 @@
 [package]
 name = "remote-installer"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 publish = false
 description = "Standalone IPA distribution over a temporary HTTPS tunnel"
