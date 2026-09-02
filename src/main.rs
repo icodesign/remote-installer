@@ -13,6 +13,8 @@ use remote_installer::service::{ShareConfig, ShareService};
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
+const TUNNEL_STARTUP_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Parser)]
 #[command(
     name = "remote-installer",
@@ -164,6 +166,8 @@ async fn share(args: ShareArgs) -> Result<(), Box<dyn std::error::Error + Send +
         _ => {}
     }
 
+    let provider: ExposureProvider = args.provider.into();
+    eprintln!("Validating build: {}...", args.artifact.display());
     let temporary = tempfile::tempdir()?;
     let source = args.artifact.clone();
     let input_staging = temporary.path().join("input");
@@ -181,14 +185,34 @@ async fn share(args: ShareArgs) -> Result<(), Box<dyn std::error::Error + Send +
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     let local_address = listener.local_addr()?;
     let origin_url = Url::parse(&format!("http://{local_address}"))?;
-    let mut exposure = ExposureSession::start(
-        args.provider.into(),
+    eprintln!(
+        "Build validated. Starting {} (this may take a few seconds)...",
+        provider.name()
+    );
+    let exposure_start = ExposureSession::start(
+        provider,
         &origin_url,
         args.tailscale_bin.as_deref(),
         args.cloudflared_bin.as_deref(),
         args.funnel_port,
-    )
-    .await?;
+    );
+    tokio::pin!(exposure_start);
+    let startup_started_at = std::time::Instant::now();
+    let mut startup_progress = tokio::time::interval_at(
+        tokio::time::Instant::now() + TUNNEL_STARTUP_PROGRESS_INTERVAL,
+        TUNNEL_STARTUP_PROGRESS_INTERVAL,
+    );
+    let mut exposure = loop {
+        tokio::select! {
+            result = &mut exposure_start => break result?,
+            _ = startup_progress.tick() => eprintln!(
+                "Still waiting for {}... ({} elapsed)",
+                provider.name(),
+                format_duration(startup_started_at.elapsed()),
+            ),
+        }
+    };
+    eprintln!("Tunnel ready. Preparing install page...");
     let setup_result = ShareService::create(
         temporary.path().join("artifacts"),
         exposure.public_base_url().clone(),
