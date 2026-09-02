@@ -5,7 +5,7 @@
     {
       "title": "iOS distribution",
       "description": "Getting builds onto real devices without TestFlight or a cable.",
-      "skills": ["share-ios-build"]
+      "skills": ["remote-installer"]
     }
   ]
 }

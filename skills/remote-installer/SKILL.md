@@ -1,6 +1,17 @@
 ---
 name: remote-installer
-description: Put an iOS build on a real iPhone or iPad over the air with the `remote-installer` CLI — it validates the build, opens a temporary HTTPS tunnel, and prints an install URL plus a QR code to scan. Use this whenever someone wants a build onto a physical device without TestFlight or a cable: "get this on my phone", "send this build to a tester", "share the IPA", "install this on my iPad", "let QA try this build", "make a link for this .app", or any mention of over-the-air / OTA install, itms-services, or ad-hoc distribution. Also use it when someone has just finished an Xcode build or archive and asks how to get it onto a device. Not for Simulator installs (build and run directly instead) and not for App Store or TestFlight submission.
+description: >-
+  Put an iOS build on a real iPhone or iPad over the air with the
+  `remote-installer` CLI — it validates the build, opens a temporary HTTPS
+  tunnel, and prints an install URL plus a QR code to scan. Use this whenever
+  someone wants a build onto a physical device without TestFlight or a cable:
+  "get this on my phone", "send this build to a tester", "share the IPA",
+  "install this on my iPad", "let QA try this build", "make a link for this
+  .app", or any mention of over-the-air / OTA install, itms-services, or ad-hoc
+  distribution. Also use it when someone has just finished an Xcode build or
+  archive and asks how to get it onto a device. Not for Simulator installs
+  (build and run directly instead) and not for App Store or TestFlight
+  submission.
 ---
 
 # Sharing an iOS build over the air

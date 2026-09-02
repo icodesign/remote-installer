@@ -41,6 +41,9 @@ jobs:
           node-version: "24"
           package-manager-cache: false
 
+      - name: Check agent skill discovery
+        run: npx --yes skills add . --list
+
       - name: Check JavaScript packaging scripts
         run: |
           set -euo pipefail

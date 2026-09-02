@@ -81,6 +81,7 @@ jobs:
           cargo fmt --all -- --check
           cargo clippy --all-targets --locked -- -D warnings
           cargo test --locked
+          npx --yes skills add . --list
           node --check packaging/npm/bin/remote-installer.js
           node --check packaging/npm/build-package.mjs
           node -e 'JSON.parse(require("fs").readFileSync("packaging/npm/package.json.template", "utf8"))'
