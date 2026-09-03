@@ -1,6 +1,6 @@
 [package]
 name = "remote-installer"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2024"
 publish = false
 description = "Standalone iOS and Android app distribution over a temporary HTTPS tunnel"
