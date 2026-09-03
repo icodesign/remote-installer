@@ -7,9 +7,9 @@ use thiserror::Error;
 use tokio::sync::{Mutex, Notify};
 use url::Url;
 
-use crate::artifact_input::{ArtifactInputError, PreparedIpa};
+use crate::artifact_input::{ArtifactInputError, PreparedArtifact};
 use crate::ipa::{self, ManifestAssets};
-use crate::model::{Artifact, Availability};
+use crate::model::{Artifact, Availability, Platform, PlatformMetadata};
 
 /// A manifest-issued download grant is intentionally short-lived. It covers
 /// all Range requests for one OTA attempt, while preventing a copied grant
@@ -52,13 +52,13 @@ pub struct ShareConfig {
 /// The artifact itself is immutable, so the only mutable state is the spent
 /// download count (an atomic) and the live grant table (a small map). That is
 /// deliberately not hidden behind a repository abstraction: this process owns
-/// exactly one IPA in one temporary directory, and public downloads always
+/// exactly one installable package in one temporary directory, and public downloads always
 /// pass through this service, so there is no second URL or credential-bearing
 /// storage path for a client to bypass.
 pub struct ShareService {
     public_base_url: Url,
     artifact: Artifact,
-    ipa_path: PathBuf,
+    package_path: PathBuf,
     icon_path: Option<PathBuf>,
     /// When the share stops serving, if `--timeout`/`--expire-after` was given.
     ///
@@ -87,16 +87,16 @@ struct DownloadGrant {
 }
 
 impl ShareService {
-    /// Stage the prepared IPA (and its icon, when it has one) into
+    /// Stage the prepared package (and its icon, when it has one) into
     /// `workspace_dir` and build the session that serves them.
     ///
     /// The bytes are copied rather than served from wherever the caller found
     /// them: a share can outlive the build that produced it, and serving a
-    /// file someone is concurrently rebuilding would hand a device a torn IPA.
+    /// file someone is concurrently rebuilding would hand a device a torn package.
     pub async fn create(
         workspace_dir: impl Into<PathBuf>,
         public_base_url: Url,
-        prepared: &PreparedIpa,
+        prepared: &PreparedArtifact,
         config: ShareConfig,
     ) -> Result<Self, ServiceError> {
         let workspace_dir = workspace_dir.into();
@@ -104,13 +104,17 @@ impl ShareService {
 
         let metadata = prepared.metadata().clone();
         let id = format!("artifact-{}", uuid::Uuid::new_v4());
-        let ipa_path = workspace_dir.join(format!("{id}.ipa"));
-        tokio::fs::copy(prepared.path(), &ipa_path).await?;
+        let extension = match &metadata.platform_metadata {
+            PlatformMetadata::Ios(_) => "ipa",
+            PlatformMetadata::Android(_) => "apk",
+        };
+        let package_path = workspace_dir.join(format!("{id}.{extension}"));
+        tokio::fs::copy(prepared.path(), &package_path).await?;
 
-        let icon_path = match metadata.icon.as_ref() {
+        let icon_path = match metadata.icon_png.as_ref() {
             Some(icon) => {
                 let icon_path = workspace_dir.join(format!("{id}.icon.png"));
-                tokio::fs::write(&icon_path, &icon.bytes).await?;
+                tokio::fs::write(&icon_path, icon).await?;
                 Some(icon_path)
             }
             None => {
@@ -127,18 +131,15 @@ impl ShareService {
             file_name: metadata.file_name,
             byte_count: metadata.byte_count,
             sha256: metadata.sha256,
-            bundle_identifier: metadata.bundle_identifier,
-            bundle_version: metadata.bundle_version,
-            bundle_short_version: metadata.bundle_short_version,
             display_name: metadata.display_name,
-            minimum_os_version: metadata.minimum_os_version,
+            platform_metadata: metadata.platform_metadata,
             has_icon: icon_path.is_some(),
         };
 
         Ok(Self {
             public_base_url,
             artifact,
-            ipa_path,
+            package_path,
             icon_path,
             expires_at: config
                 .artifact_ttl
@@ -201,7 +202,7 @@ impl ShareService {
         }
     }
 
-    /// Issue an opaque, short-lived grant for the next OTA download. The grant
+    /// Issue an opaque, short-lived grant for the next package download. The grant
     /// is intentionally not counted until the first download request arrives:
     /// opening a manifest must not consume a download slot.
     pub async fn issue_download_grant(&self, artifact_id: &str) -> Result<String, ServiceError> {
@@ -236,7 +237,8 @@ impl ShareService {
     /// independent request. This keeps iOS resume behavior working without
     /// letting Range requests bypass the quota.
     ///
-    /// The grant table lock is held across the slot claim so that marking a
+    /// iOS obtains this grant from its manifest; Android obtains it from the
+    /// install page. The grant table lock is held across the slot claim so that marking a
     /// grant claimed and spending its slot cannot interleave.
     pub async fn authorize_download(
         &self,
@@ -276,7 +278,7 @@ impl ShareService {
             max_downloads = ?self.max_downloads,
             has_grant = grant_token.is_some(),
             resuming,
-            "IPA download authorized"
+            "package download authorized"
         );
         Ok(&self.artifact)
     }
@@ -341,7 +343,7 @@ impl ShareService {
     /// Resolve an artifact to the local file managed by this share session.
     pub fn download_path(&self, artifact_id: &str) -> Result<&Path, ServiceError> {
         self.match_id(artifact_id)?;
-        Ok(&self.ipa_path)
+        Ok(&self.package_path)
     }
 
     pub fn icon_path(&self, artifact_id: &str) -> Result<&Path, ServiceError> {
@@ -355,7 +357,11 @@ impl ShareService {
         let grant = self.issue_download_grant(&artifact.id).await?;
         Ok(format!(
             "{}?download={grant}",
-            self.local_route(&format!("/api/v1/artifacts/{}/download.ipa", artifact.id))
+            self.local_route(&format!(
+                "/api/v1/artifacts/{}/download.{}",
+                artifact.id,
+                artifact.download_extension()
+            ))
         ))
     }
 
@@ -373,11 +379,19 @@ impl ShareService {
             .then(|| self.local_route(&format!("/api/v1/artifacts/{}/icon.png", artifact.id)))
     }
 
-    pub fn itms_services_url(&self, artifact: &Artifact) -> String {
-        ipa::itms_services_url(&self.manifest_url(artifact))
+    pub async fn install_action_url(&self, artifact: &Artifact) -> Result<String, ServiceError> {
+        match artifact.platform() {
+            Platform::Ios => Ok(ipa::itms_services_url(&self.manifest_url(artifact))),
+            Platform::Android => self.artifact_download_url(artifact).await,
+        }
     }
 
     pub async fn manifest(&self, artifact: &Artifact) -> Result<String, ServiceError> {
+        let PlatformMetadata::Ios(metadata) = &artifact.platform_metadata else {
+            return Err(ServiceError::NotFound(
+                "Android packages do not use an OTA manifest".into(),
+            ));
+        };
         let download_url = self.artifact_download_url(artifact).await?;
         let icon_url = self.icon_url(artifact);
         // iOS renders the home-screen placeholder from these two assets while
@@ -388,8 +402,8 @@ impl ShareService {
             full_size_image_url: icon_url.as_deref(),
         };
         Ok(ipa::manifest_xml(
-            &artifact.bundle_identifier,
-            &artifact.bundle_version,
+            &metadata.bundle_identifier,
+            &metadata.bundle_version,
             artifact.title(),
             &assets,
         ))
@@ -497,7 +511,10 @@ mod tests {
         let artifact = service.artifact().clone();
 
         assert!(artifact.has_icon);
-        assert_eq!(artifact.minimum_os_version.as_deref(), Some("16.0"));
+        let PlatformMetadata::Ios(metadata) = &artifact.platform_metadata else {
+            panic!("fixture should produce an iOS artifact");
+        };
+        assert_eq!(metadata.minimum_os_version.as_deref(), Some("16.0"));
         assert_eq!(
             service.icon_url(&artifact).as_deref(),
             Some(

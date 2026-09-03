@@ -1,7 +1,7 @@
 {
   "name": "@@NPM_PACKAGE_NAME@@",
   "version": "@@VERSION@@",
-  "description": "Share a signed iOS build over a temporary HTTPS tunnel",
+  "description": "Share signed iOS and Android builds over a temporary HTTPS tunnel",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/icodesign/remote-installer.git"

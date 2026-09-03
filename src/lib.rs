@@ -1,3 +1,4 @@
+pub mod apk;
 pub mod artifact_input;
 pub mod exposure;
 pub mod http;

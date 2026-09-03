@@ -8,7 +8,7 @@ const { spawn } = require('child_process');
 
 if (process.platform !== 'darwin') {
   console.error(
-    'remote-installer requires macOS (darwin) because it uses macOS iOS-signing tools.'
+    'The published remote-installer package currently provides binaries for macOS (darwin) only.'
   );
   process.exit(1);
 }

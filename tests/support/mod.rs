@@ -116,6 +116,93 @@ pub async fn spawn_server(options: SpawnOptions) -> SpawnedServer {
     }
 }
 
+/// Android counterpart to `spawn_server`, using the checked-in signed APK and
+/// deterministic stand-ins for Android SDK metadata output. Signature-command
+/// failure behavior is covered by `apk` unit tests; this harness owns the HTTP
+/// composition from a prepared Android artifact onward.
+#[cfg(unix)]
+pub async fn spawn_android_server(options: SpawnOptions) -> SpawnedServer {
+    use remote_installer::apk::ApkToolchain;
+    use std::os::unix::fs::PermissionsExt;
+
+    let state_dir = tempfile::tempdir().expect("create temp state dir");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback listener");
+    let local_addr: SocketAddr = listener.local_addr().expect("listener local address");
+    let base_url = format!("http://127.0.0.1:{}", local_addr.port());
+    let public_base_url = Url::parse(&base_url).expect("parse public base url");
+
+    let fixture_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/android/signed-fixture.apk");
+    let artifact_bytes = std::fs::read(&fixture_path).expect("read signed APK fixture");
+    let analyzer = state_dir.path().join("apkanalyzer");
+    std::fs::write(
+        &analyzer,
+        r#"#!/bin/sh
+case "$1 $2" in
+  "manifest print") printf '%s\n' '<manifest package="com.rootstudio.remoteinstaller.fixture"><application android:label="Remote Installer Fixture" /></manifest>' ;;
+  "manifest application-id") printf '%s\n' 'com.rootstudio.remoteinstaller.fixture' ;;
+  "manifest version-code") printf '%s\n' '7' ;;
+  "manifest version-name") printf '%s\n' '1.2.3' ;;
+  "manifest min-sdk") printf '%s\n' '26' ;;
+  "manifest target-sdk") printf '%s\n' '36' ;;
+  *) exit 64 ;;
+esac
+"#,
+    )
+    .expect("write fake apkanalyzer");
+    let signer = state_dir.path().join("apksigner");
+    std::fs::write(
+        &signer,
+        "#!/bin/sh\nprintf '%s\\n' 'Signer #1 certificate SHA-256 digest: 95f3fc3ee59a9d33792c2fb0b8bebd63836b312e30f03d8db5855bd98731a5b7'\n",
+    )
+    .expect("write fake apksigner");
+    for tool in [&analyzer, &signer] {
+        let mut permissions = std::fs::metadata(tool).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(tool, permissions).unwrap();
+    }
+    let toolchain = ApkToolchain::new(analyzer, signer);
+    let prepared = artifact_input::prepare_with_apk_toolchain(
+        &fixture_path,
+        None,
+        &state_dir.path().join("staging"),
+        artifact_input::SigningPolicy::Required,
+        Some(&toolchain),
+    )
+    .expect("prepare fixture APK");
+    let service = ShareService::create(
+        state_dir.path().join("workspace"),
+        public_base_url,
+        &prepared,
+        options.share_config,
+    )
+    .await
+    .expect("construct Android ShareService");
+    let artifact = service.artifact().clone();
+    let state = HttpState {
+        service: std::sync::Arc::new(service),
+    };
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let shutdown = async move {
+            let _ = shutdown_rx.await;
+        };
+        if let Err(error) = http::run_listener(listener, state, shutdown).await {
+            eprintln!("test Android origin exited with an error: {error}");
+        }
+    });
+
+    SpawnedServer {
+        base_url,
+        artifact,
+        artifact_bytes,
+        _state_dir: state_dir,
+        shutdown: Some(shutdown_tx),
+    }
+}
+
 /// A `reqwest::Client` with redirects disabled, so an unexpected redirect is
 /// observable instead of being followed transparently.
 pub fn http_client() -> Client {

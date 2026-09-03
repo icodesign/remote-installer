@@ -5,10 +5,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use remote_installer::apk::ApkToolchain;
 use remote_installer::artifact_input::{self, SigningPolicy};
 use remote_installer::exposure::{ExposureProvider, ExposureSession};
 use remote_installer::http::{self, HttpState};
-use remote_installer::model::{Artifact, Availability};
+use remote_installer::model::{Artifact, Availability, PlatformMetadata};
 use remote_installer::service::{ShareConfig, ShareService};
 use tracing_subscriber::EnvFilter;
 use url::Url;
@@ -19,7 +20,7 @@ const TUNNEL_STARTUP_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 #[command(
     name = "remote-installer",
     version,
-    about = "Standalone iOS app distribution over a temporary HTTPS tunnel"
+    about = "Standalone iOS and Android app distribution over a temporary HTTPS tunnel"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -28,7 +29,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Share one IPA or signed iOS .app through a temporary HTTPS tunnel.
+    /// Share one IPA, signed iOS .app, or signed standalone APK.
     #[command(after_help = SHARE_EXAMPLES)]
     Share(ShareArgs),
 }
@@ -46,11 +47,14 @@ Examples:
 
   # Keep the build off Cloudflare's servers (needs a Tailscale account)
   remote-installer share MyApp.ipa --provider tailscale
+
+  # Share a signed standalone Android APK
+  remote-installer share MyApp.apk
 ";
 
 #[derive(Debug, Args)]
 struct ShareArgs {
-    /// Development/ad-hoc signed IPA or iphoneos .app to share.
+    /// Development/ad-hoc IPA, iphoneos .app, or signed standalone APK.
     artifact: PathBuf,
     /// Stop sharing and exit after this many seconds.
     #[arg(
@@ -72,9 +76,8 @@ struct ShareArgs {
     /// Do not print the install link as a terminal QR code.
     #[arg(long)]
     no_qr: bool,
-    /// Share an IPA even if it is unsigned, has no provisioning profile, or
-    /// carries an expired or mismatched one. iOS will most likely refuse to
-    /// install it.
+    /// Share an IPA even when its iOS signing evidence is unusable. This does
+    /// not control APK checks.
     #[arg(long)]
     allow_unsigned: bool,
     /// Public HTTPS port used by Tailscale Funnel (Tailscale only).
@@ -86,6 +89,12 @@ struct ShareArgs {
     /// Explicit path to the cloudflared CLI.
     #[arg(long, value_name = "PATH")]
     cloudflared_bin: Option<PathBuf>,
+    /// Explicit path to the Android SDK apkanalyzer tool.
+    #[arg(long, value_name = "PATH")]
+    apkanalyzer_bin: Option<PathBuf>,
+    /// Explicit path to the Android SDK apksigner tool.
+    #[arg(long, value_name = "PATH")]
+    apksigner_bin: Option<PathBuf>,
     /// Loopback address for the temporary origin server.
     #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:0")]
     listen: SocketAddr,
@@ -167,6 +176,22 @@ async fn share(args: ShareArgs) -> Result<(), Box<dyn std::error::Error + Send +
     }
 
     let provider: ExposureProvider = args.provider.into();
+    let is_apk = args
+        .artifact
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("apk"));
+    if !is_apk && (args.apkanalyzer_bin.is_some() || args.apksigner_bin.is_some()) {
+        return Err("--apkanalyzer-bin and --apksigner-bin require an APK artifact".into());
+    }
+    let apk_toolchain = is_apk
+        .then(|| {
+            ApkToolchain::discover(
+                args.apkanalyzer_bin.as_deref(),
+                args.apksigner_bin.as_deref(),
+            )
+        })
+        .transpose()?;
     eprintln!("Validating build: {}...", args.artifact.display());
     let temporary = tempfile::tempdir()?;
     let source = args.artifact.clone();
@@ -179,14 +204,29 @@ async fn share(args: ShareArgs) -> Result<(), Box<dyn std::error::Error + Send +
     // Validation runs before the tunnel opens, so a build that cannot install
     // fails without ever having been exposed publicly.
     let prepared = tokio::task::spawn_blocking(move || {
-        artifact_input::prepare(&source, None, &input_staging, signing_policy)
+        artifact_input::prepare_with_apk_toolchain(
+            &source,
+            None,
+            &input_staging,
+            signing_policy,
+            apk_toolchain.as_ref(),
+        )
     })
     .await??;
+    let validation_was_degraded = !prepared.warnings().is_empty();
+    for warning in prepared.warnings() {
+        eprintln!("Warning: {warning}");
+    }
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     let local_address = listener.local_addr()?;
     let origin_url = Url::parse(&format!("http://{local_address}"))?;
+    let validation_summary = if validation_was_degraded {
+        "Basic build checks passed"
+    } else {
+        "Build validated"
+    };
     eprintln!(
-        "Build validated. Starting {} (this may take a few seconds)...",
+        "{validation_summary}. Starting {} (this may take a few seconds)...",
         provider.name()
     );
     let exposure_start = ExposureSession::start(
@@ -234,12 +274,12 @@ async fn share(args: ShareArgs) -> Result<(), Box<dyn std::error::Error + Send +
     };
     let artifact = service.artifact().clone();
     let install_page_url = service.install_page_url(&artifact);
-    let itms_services_url = service.itms_services_url(&artifact);
+    let install_action_url = service.install_action_url(&artifact).await?;
     print_share_banner(
         &artifact,
         &exposure,
         &install_page_url,
-        &itms_services_url,
+        &install_action_url,
         &args,
     );
 
@@ -293,16 +333,25 @@ fn print_share_banner(
     artifact: &Artifact,
     exposure: &ExposureSession,
     install_page_url: &str,
-    itms_services_url: &str,
+    install_action_url: &str,
     args: &ShareArgs,
 ) {
     println!("App: {}", artifact.title());
-    if let Some(version) = artifact.minimum_os_version.as_deref() {
-        println!("Requires: iOS {version} or later");
+    match &artifact.platform_metadata {
+        PlatformMetadata::Ios(metadata) => {
+            if let Some(version) = metadata.minimum_os_version.as_deref() {
+                println!("Requires: iOS {version} or later");
+            }
+        }
+        PlatformMetadata::Android(metadata) => {
+            if let Some(api) = metadata.min_sdk {
+                println!("Requires: Android API {api} or later");
+            }
+        }
     }
     println!("Tunnel: {}", exposure.provider().name());
     println!("Install page: {install_page_url}");
-    println!("Install link: {itms_services_url}");
+    println!("Install link: {install_action_url}");
     if let Some(expiry) = args.artifact_ttl() {
         println!("Expires in: {}", format_duration(expiry));
     }
@@ -311,7 +360,7 @@ fn print_share_banner(
     }
     if !args.no_qr {
         match qr_code(install_page_url) {
-            Some(code) => println!("\nScan with the iPhone camera:\n\n{code}"),
+            Some(code) => println!("\nScan with the phone camera:\n\n{code}"),
             None => tracing::debug!("install URL could not be encoded as a QR code"),
         }
     }
@@ -423,6 +472,31 @@ mod tests {
         let cli = Cli::try_parse_from(["remote-installer", "share", "Example.ipa"]).unwrap();
         let Command::Share(args) = cli.command;
         assert!(matches!(args.provider, ShareProvider::Cloudflare));
+    }
+
+    #[test]
+    fn android_sdk_tool_overrides_are_parsed_as_one_toolchain() {
+        let cli = Cli::try_parse_from([
+            "remote-installer",
+            "share",
+            "Example.apk",
+            "--apkanalyzer-bin",
+            "/sdk/cmdline-tools/latest/bin/apkanalyzer",
+            "--apksigner-bin",
+            "/sdk/build-tools/36.0.0/apksigner",
+        ])
+        .unwrap();
+        let Command::Share(args) = cli.command;
+        assert_eq!(
+            args.apkanalyzer_bin.as_deref(),
+            Some(std::path::Path::new(
+                "/sdk/cmdline-tools/latest/bin/apkanalyzer"
+            ))
+        );
+        assert_eq!(
+            args.apksigner_bin.as_deref(),
+            Some(std::path::Path::new("/sdk/build-tools/36.0.0/apksigner"))
+        );
     }
 
     #[test]

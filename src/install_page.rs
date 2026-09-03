@@ -1,9 +1,9 @@
-use crate::model::{Artifact, Availability, format_bytes};
+use crate::model::{Artifact, Availability, PlatformMetadata, format_bytes};
 
 /// Render the public install page for an artifact.
 ///
 /// The install page intentionally contains no JavaScript or external assets:
-/// the only action is the `itms-services` link that iOS handles natively.
+/// the only action is the platform install URL produced by the service.
 ///
 /// A share that can no longer install still renders the whole page, with the
 /// button replaced by the reason. Answering 410 instead would leave someone
@@ -11,16 +11,60 @@ use crate::model::{Artifact, Availability, format_bytes};
 /// which build it was or whether they were even at the right link.
 pub fn render(
     artifact: &Artifact,
-    itms_url: &str,
+    install_action_url: &str,
     icon_url: Option<&str>,
     availability: Availability,
 ) -> String {
     let display_name = html_escape(artifact.title());
-    let bundle_identifier = html_escape(&artifact.bundle_identifier);
+    let (
+        identifier_label,
+        identifier,
+        compatibility_markup,
+        install_guidance_markup,
+        package_kind,
+        cta_label,
+        install_aria,
+    ) = match &artifact.platform_metadata {
+        PlatformMetadata::Ios(metadata) => {
+            let compatibility = metadata
+                .minimum_os_version
+                .as_deref()
+                .map(str::trim)
+                .filter(|version| !version.is_empty())
+                .map(|version| {
+                    compatibility_markup(&format!("Requires iOS {} or later", html_escape(version)))
+                })
+                .unwrap_or_default();
+            (
+                "Bundle ID",
+                html_escape(&metadata.bundle_identifier),
+                compatibility,
+                String::new(),
+                "IPA",
+                "Install",
+                format!("Install {display_name} on this iPhone or iPad"),
+            )
+        }
+        PlatformMetadata::Android(metadata) => {
+            let compatibility = metadata
+                .min_sdk
+                .map(|api| compatibility_markup(&format!("Requires Android API {api} or later")))
+                .unwrap_or_default();
+            (
+                    "Package name",
+                    html_escape(metadata.package_name.as_deref().unwrap_or("Unavailable")),
+                    compatibility,
+                "<p class=\"install-guidance\">After downloading, open the APK. Android may ask you to allow installs from this browser.</p>".into(),
+                "APK",
+                "Download APK",
+                format!("Download {display_name} for Android"),
+                )
+        }
+    };
     let version = html_escape(&version_label(artifact));
     let size = html_escape(&format_bytes(artifact.byte_count));
     let sha256 = html_escape(&abbreviate_sha256(&artifact.sha256));
-    let itms_url = html_escape(itms_url);
+    let install_action_url = html_escape(install_action_url);
     let icon_markup = match icon_url {
         Some(icon_url) => format!(
             "<div class=\"install-icon\"><img class=\"install-icon-image\" src=\"{}\" alt=\"{} app icon\" width=\"92\" height=\"92\" decoding=\"async\"></div>",
@@ -29,28 +73,9 @@ pub fn render(
         ),
         None => "<div class=\"install-icon install-icon-missing\" role=\"img\" aria-label=\"App icon unavailable\"></div>".into(),
     };
-    let compatibility_markup = match artifact
-        .minimum_os_version
-        .as_deref()
-        .map(str::trim)
-        .filter(|version| !version.is_empty())
-    {
-        Some(minimum_os_version) => format!(
-            r##"<p class="install-compatibility">
-          <svg class="install-info" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-            <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2"></circle>
-            <line x1="12" y1="11" x2="12" y2="16" stroke="currentColor" stroke-width="2" stroke-linecap="round"></line>
-            <circle cx="12" cy="8" r="1" fill="currentColor"></circle>
-          </svg>
-          <span class="install-compatibility-text">Requires iOS {} or later</span>
-        </p>"##,
-            html_escape(minimum_os_version),
-        ),
-        None => String::new(),
-    };
     let cta_markup = match availability {
         Availability::Installable => format!(
-            r#"<a class="install-cta" href="{itms_url}" aria-label="Install {display_name} on this iPhone or iPad">Install</a>"#
+            r#"<a class="install-cta" href="{install_action_url}" aria-label="{install_aria}">{cta_label}</a>"#
         ),
         Availability::LimitReached => notice_markup(
             "Download limit reached",
@@ -70,7 +95,7 @@ pub fn render(
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#18181b" media="(prefers-color-scheme: dark)">
-  <title>Install {display_name} · IPA</title>
+  <title>Install {display_name} · {package_kind}</title>
   <style>
     :root {{
       color-scheme: light;
@@ -257,6 +282,14 @@ pub fn render(
       overflow-wrap: anywhere;
     }}
 
+    .install-guidance {{
+      margin: -10px 0 20px;
+      color: var(--text-tertiary);
+      font-size: 13px;
+      line-height: 1.45;
+      text-align: center;
+    }}
+
     .install-details {{
       min-width: 0;
       padding: 4px 16px;
@@ -436,11 +469,12 @@ pub fn render(
 
       <div class="install-content">
         {compatibility_markup}
+        {install_guidance_markup}
 
         <dl class="install-details">
           <div class="install-row">
-            <dt class="install-label">Bundle ID</dt>
-            <dd class="install-value">{bundle_identifier}</dd>
+            <dt class="install-label">{identifier_label}</dt>
+            <dd class="install-value">{identifier}</dd>
           </div>
           <div class="install-row">
             <dt class="install-label">Version</dt>
@@ -478,19 +512,39 @@ fn notice_markup(heading: &str, detail: &str) -> String {
     )
 }
 
-fn version_label(artifact: &Artifact) -> String {
-    let build = artifact.bundle_version.trim();
-    let short = artifact
-        .bundle_short_version
-        .as_deref()
-        .map(str::trim)
-        .filter(|version| !version.is_empty());
+fn compatibility_markup(message: &str) -> String {
+    format!(
+        r##"<p class="install-compatibility">
+          <svg class="install-info" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2"></circle>
+            <line x1="12" y1="11" x2="12" y2="16" stroke="currentColor" stroke-width="2" stroke-linecap="round"></line>
+            <circle cx="12" cy="8" r="1" fill="currentColor"></circle>
+          </svg>
+          <span class="install-compatibility-text">{message}</span>
+        </p>"##
+    )
+}
 
-    match short {
-        Some(short) if build.is_empty() => short.to_string(),
-        Some(short) if short == build => short.to_string(),
-        Some(short) => format!("{short} ({build})"),
-        None => build.to_string(),
+fn version_label(artifact: &Artifact) -> String {
+    let (build, display) = match &artifact.platform_metadata {
+        PlatformMetadata::Ios(metadata) => (
+            Some(metadata.bundle_version.as_str()),
+            metadata.bundle_short_version.as_deref(),
+        ),
+        PlatformMetadata::Android(metadata) => (
+            metadata.version_code.as_deref(),
+            metadata.version_name.as_deref(),
+        ),
+    };
+    let build = build.map(str::trim).filter(|version| !version.is_empty());
+    let short = display.map(str::trim).filter(|version| !version.is_empty());
+
+    match (short, build) {
+        (Some(short), None) => short.to_string(),
+        (Some(short), Some(build)) if short == build => short.to_string(),
+        (Some(short), Some(build)) => format!("{short} ({build})"),
+        (None, Some(build)) => build.to_string(),
+        (None, None) => "Unavailable".into(),
     }
 }
 
@@ -530,20 +584,29 @@ mod tests {
             file_name: "Console.ipa".into(),
             byte_count: 214_600_000,
             sha256: "7c9e2a1234567890abcdef5fb81d".into(),
-            bundle_identifier: "com.rootstudio.console".into(),
-            bundle_version: "1142".into(),
-            bundle_short_version: Some("2.9.0".into()),
             display_name: Some("Console".into()),
-            minimum_os_version: Some("16.0".into()),
+            platform_metadata: PlatformMetadata::Ios(crate::model::IosMetadata {
+                bundle_identifier: "com.rootstudio.console".into(),
+                bundle_version: "1142".into(),
+                bundle_short_version: Some("2.9.0".into()),
+                minimum_os_version: Some("16.0".into()),
+            }),
             has_icon: false,
         }
+    }
+
+    fn ios_metadata_mut(artifact: &mut Artifact) -> &mut crate::model::IosMetadata {
+        let PlatformMetadata::Ios(metadata) = &mut artifact.platform_metadata else {
+            panic!("test artifact should be iOS");
+        };
+        metadata
     }
 
     #[test]
     fn render_escapes_dynamic_text_and_url() {
         let mut artifact = artifact();
         artifact.display_name = Some("<Console & \"Preview\">".into());
-        artifact.bundle_identifier = "com.example/a'&\"<".into();
+        ios_metadata_mut(&mut artifact).bundle_identifier = "com.example/a'&\"<".into();
         let html = render(
             &artifact,
             "itms-services://?action=download-manifest&url=https://example.test/m?a=\"x\"",
@@ -589,7 +652,7 @@ mod tests {
     #[test]
     fn render_states_minimum_os_version_truthfully_and_omits_the_claim_when_unknown() {
         let mut with_min_os = artifact();
-        with_min_os.minimum_os_version = Some("16.0".into());
+        ios_metadata_mut(&mut with_min_os).minimum_os_version = Some("16.0".into());
         let html = render(
             &with_min_os,
             "itms-services://example.test/install",
@@ -603,7 +666,7 @@ mod tests {
         assert!(!html.contains("此设备兼容"));
 
         let mut without_min_os = artifact();
-        without_min_os.minimum_os_version = None;
+        ios_metadata_mut(&mut without_min_os).minimum_os_version = None;
         let html = render(
             &without_min_os,
             "itms-services://example.test/install",
@@ -646,11 +709,70 @@ mod tests {
         let mut artifact = artifact();
         assert_eq!(version_label(&artifact), "2.9.0 (1142)");
 
-        artifact.bundle_short_version = Some("1142".into());
+        ios_metadata_mut(&mut artifact).bundle_short_version = Some("1142".into());
         assert_eq!(version_label(&artifact), "1142");
 
-        artifact.bundle_short_version = None;
+        ios_metadata_mut(&mut artifact).bundle_short_version = None;
         assert_eq!(version_label(&artifact), "1142");
+    }
+
+    #[test]
+    fn android_page_uses_package_metadata_and_a_direct_apk_action() {
+        let mut artifact = artifact();
+        artifact.file_name = "Console.apk".into();
+        artifact.platform_metadata = PlatformMetadata::Android(crate::model::AndroidMetadata {
+            package_name: Some("com.rootstudio.console".into()),
+            version_code: Some("1142".into()),
+            version_name: Some("2.9.0".into()),
+            min_sdk: Some(26),
+            target_sdk: Some(36),
+            certificate_sha256: Some("abcdef".into()),
+        });
+
+        let html = render(
+            &artifact,
+            "https://example.test/api/v1/artifacts/artifact-1/download.apk?download=grant",
+            None,
+            Availability::Installable,
+        );
+
+        assert!(html.contains("<title>Install Console · APK</title>"));
+        assert!(html.contains(">Package name</dt>"));
+        assert!(html.contains("com.rootstudio.console"));
+        assert!(html.contains("Requires Android API 26 or later"));
+        assert!(html.contains("2.9.0 (1142)"));
+        assert!(html.contains("download.apk?download=grant"));
+        assert!(html.contains("aria-label=\"Download Console for Android\""));
+        assert!(html.contains(">Download APK</a>"));
+        assert!(html.contains("allow installs from this browser"));
+        assert!(!html.contains("itms-services://"));
+        assert!(!html.contains("Requires iOS"));
+    }
+
+    #[test]
+    fn android_page_is_honest_when_sdk_metadata_was_not_available() {
+        let mut artifact = artifact();
+        artifact.file_name = "Console.apk".into();
+        artifact.platform_metadata = PlatformMetadata::Android(crate::model::AndroidMetadata {
+            package_name: None,
+            version_code: None,
+            version_name: None,
+            min_sdk: None,
+            target_sdk: None,
+            certificate_sha256: None,
+        });
+
+        let html = render(
+            &artifact,
+            "https://example.test/api/v1/artifacts/artifact-1/download.apk?download=grant",
+            None,
+            Availability::Installable,
+        );
+
+        assert!(html.contains(">Package name</dt>"));
+        assert_eq!(html.matches(">Unavailable<").count(), 2);
+        assert!(!html.contains("Requires Android API"));
+        assert!(html.contains(">Download APK</a>"));
     }
 
     #[test]

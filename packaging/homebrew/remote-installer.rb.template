@@ -1,5 +1,5 @@
 class RemoteInstaller < Formula
-  desc "Share a signed iOS build over a temporary HTTPS tunnel"
+  desc "Share signed iOS and Android builds over a temporary HTTPS tunnel"
   homepage "@@HOMEPAGE@@"
   version "@@VERSION@@"
   depends_on :macos

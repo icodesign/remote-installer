@@ -3,7 +3,7 @@ name = "remote-installer"
 version = "0.1.3"
 edition = "2024"
 publish = false
-description = "Standalone IPA distribution over a temporary HTTPS tunnel"
+description = "Standalone iOS and Android app distribution over a temporary HTTPS tunnel"
 
 # Standalone workspace: this crate deliberately depends on no sibling crate.
 [workspace]

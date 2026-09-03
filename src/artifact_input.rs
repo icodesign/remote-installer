@@ -8,7 +8,9 @@ use plist::Value;
 use tempfile::TempDir;
 use thiserror::Error;
 
+use crate::apk::{self, ApkError, ApkToolchain};
 use crate::ipa::{self, IpaError, IpaMetadata, SigningEvidence};
+use crate::model::{AndroidMetadata, IosMetadata, PlatformMetadata};
 
 #[derive(Debug, Error)]
 pub enum ArtifactInputError {
@@ -18,6 +20,8 @@ pub enum ArtifactInputError {
     Plist(#[from] plist::Error),
     #[error(transparent)]
     Ipa(#[from] IpaError),
+    #[error(transparent)]
+    Apk(#[from] ApkError),
     #[error("artifact input is invalid: {0}")]
     Invalid(String),
     #[error("{tool} failed: {message}")]
@@ -33,21 +37,38 @@ pub enum SigningPolicy {
     Trusted,
 }
 
-/// A canonical IPA ready for repository storage. The temporary directory, when
-/// present, owns an IPA packaged from a local iOS app bundle.
-pub struct PreparedIpa {
+/// A canonical installable package ready for the share service to stage.
+/// The temporary directory, when present, owns a package derived from an input
+/// such as a local iOS app bundle.
+pub struct PreparedArtifact {
     path: PathBuf,
-    metadata: IpaMetadata,
+    metadata: PreparedArtifactMetadata,
+    warnings: Vec<String>,
     _temporary: Option<TempDir>,
 }
 
-impl PreparedIpa {
+#[derive(Debug, Clone)]
+pub struct PreparedArtifactMetadata {
+    pub file_name: String,
+    pub byte_count: u64,
+    pub sha256: String,
+    pub display_name: Option<String>,
+    pub platform_metadata: PlatformMetadata,
+    pub icon_png: Option<Vec<u8>>,
+}
+
+impl PreparedArtifact {
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    pub fn metadata(&self) -> &IpaMetadata {
+    pub fn metadata(&self) -> &PreparedArtifactMetadata {
         &self.metadata
+    }
+
+    /// Non-fatal validation checks that could not be performed.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 }
 
@@ -64,7 +85,34 @@ pub fn prepare(
     requested_file_name: Option<&str>,
     staging_root: &Path,
     signing_policy: SigningPolicy,
-) -> Result<PreparedIpa, ArtifactInputError> {
+) -> Result<PreparedArtifact, ArtifactInputError> {
+    let apk_toolchain = source
+        .extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("apk"))
+        .then(|| ApkToolchain::discover(None, None))
+        .transpose()?;
+    prepare_with_apk_toolchain(
+        source,
+        requested_file_name,
+        staging_root,
+        signing_policy,
+        apk_toolchain.as_ref(),
+    )
+}
+
+/// Prepare either an iOS package or an Android APK.
+///
+/// Android inspection uses the official SDK tools when available. Keeping the
+/// selected toolchain explicit here makes tests deterministic and prevents
+/// platform tool discovery from leaking into the artifact/service layers.
+pub fn prepare_with_apk_toolchain(
+    source: &Path,
+    requested_file_name: Option<&str>,
+    staging_root: &Path,
+    signing_policy: SigningPolicy,
+    apk_toolchain: Option<&ApkToolchain>,
+) -> Result<PreparedArtifact, ArtifactInputError> {
     let source_metadata = std::fs::symlink_metadata(source)?;
     if source_metadata.file_type().is_symlink() {
         return Err(ArtifactInputError::Invalid(
@@ -72,11 +120,52 @@ pub fn prepare(
         ));
     }
     if source_metadata.is_file() {
+        let extension = source
+            .extension()
+            .and_then(OsStr::to_str)
+            .map(str::to_ascii_lowercase);
+        if extension.as_deref() == Some("apk") {
+            let unavailable_toolchain = ApkToolchain::from_optional_paths(None, None);
+            let toolchain = apk_toolchain.unwrap_or(&unavailable_toolchain);
+            let metadata = apk::inspect(source, requested_file_name, toolchain)?;
+            return Ok(PreparedArtifact {
+                path: source.to_path_buf(),
+                metadata: PreparedArtifactMetadata {
+                    file_name: metadata.file_name,
+                    byte_count: metadata.byte_count,
+                    sha256: metadata.sha256,
+                    display_name: metadata.display_name,
+                    platform_metadata: PlatformMetadata::Android(AndroidMetadata {
+                        package_name: metadata.package_name,
+                        version_code: metadata.version_code,
+                        version_name: metadata.version_name,
+                        min_sdk: metadata.min_sdk,
+                        target_sdk: metadata.target_sdk,
+                        certificate_sha256: metadata.certificate_sha256,
+                    }),
+                    icon_png: metadata.icon.map(|icon| icon.bytes),
+                },
+                warnings: metadata.warnings,
+                _temporary: None,
+            });
+        }
+        if extension.as_deref() == Some("aab") || extension.as_deref() == Some("apks") {
+            return Err(ArtifactInputError::Invalid(
+                "Android App Bundles and split APK sets are not directly installable; provide a signed standalone APK"
+                    .into(),
+            ));
+        }
+        if extension.as_deref() != Some("ipa") {
+            return Err(ArtifactInputError::Invalid(
+                "source file must be an IPA or APK".into(),
+            ));
+        }
         let (metadata, signing) = ipa::inspect_with_signing(source, requested_file_name)?;
         verify_ipa_signing(&metadata, &signing, signing_policy)?;
-        return Ok(PreparedIpa {
+        return Ok(PreparedArtifact {
             path: source.to_path_buf(),
-            metadata,
+            metadata: prepared_ios_metadata(metadata),
+            warnings: Vec::new(),
             _temporary: None,
         });
     }
@@ -105,11 +194,28 @@ pub fn prepare(
     // whose signature, architecture, and profile were verified directly above,
     // with tools that need the bundle on disk.
     let metadata = ipa::inspect(&output, Some(&file_name))?;
-    Ok(PreparedIpa {
+    Ok(PreparedArtifact {
         path: output,
-        metadata,
+        metadata: prepared_ios_metadata(metadata),
+        warnings: Vec::new(),
         _temporary: Some(temporary),
     })
+}
+
+fn prepared_ios_metadata(metadata: IpaMetadata) -> PreparedArtifactMetadata {
+    PreparedArtifactMetadata {
+        file_name: metadata.file_name,
+        byte_count: metadata.byte_count,
+        sha256: metadata.sha256,
+        display_name: metadata.display_name,
+        platform_metadata: PlatformMetadata::Ios(IosMetadata {
+            bundle_identifier: metadata.bundle_identifier,
+            bundle_version: metadata.bundle_version,
+            bundle_short_version: metadata.bundle_short_version,
+            minimum_os_version: metadata.minimum_os_version,
+        }),
+        icon_png: metadata.icon.map(|icon| icon.bytes),
+    }
 }
 
 /// Reject an IPA that a device would refuse anyway.

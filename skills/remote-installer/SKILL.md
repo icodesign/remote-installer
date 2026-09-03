@@ -1,28 +1,31 @@
 ---
 name: remote-installer
 description: >-
-  Put an iOS build on a real iPhone or iPad over the air with the
+  Put an iOS or Android build on a real phone or tablet over the air with the
   `remote-installer` CLI — it validates the build, opens a temporary HTTPS
   tunnel, and prints an install URL plus a QR code to scan. Use this whenever
   someone wants a build onto a physical device without TestFlight or a cable:
-  "get this on my phone", "send this build to a tester", "share the IPA",
+  "get this on my phone", "send this build to a tester", "share the IPA or APK",
   "install this on my iPad", "let QA try this build", "make a link for this
-  .app", or any mention of over-the-air / OTA install, itms-services, or ad-hoc
-  distribution. Also use it when someone has just finished an Xcode build or
-  archive and asks how to get it onto a device. Not for Simulator installs
+  .app", or any mention of over-the-air / OTA install, itms-services, APK, or ad-hoc
+  distribution. Also use it when someone has just finished an Xcode or Android
+  build and asks how to get it onto a device. Not for Simulator installs
   (build and run directly instead) and not for App Store or TestFlight
   submission.
 ---
 
-# Sharing an iOS build over the air
+# Sharing a mobile build over the air
 
-`remote-installer share <build>` validates an iOS build, stands up a temporary
-HTTPS tunnel in front of a loopback server, and prints an install page URL, an
-`itms-services://` link, and a QR code. Someone scans it, taps Install, and the
-app lands on their home screen. Stopping the process kills the link.
+`remote-installer share <build>` validates an iOS or Android build, stands up a
+temporary HTTPS tunnel in front of a loopback server, and prints an install
+page URL plus a QR code. iOS uses `itms-services://`; Android downloads a signed
+standalone APK for the system installer. Stopping the process kills the link.
 
-macOS only — the tool shells out to `codesign`, `lipo`, `security`, `ditto`
-and `sips`.
+The published CLI is currently macOS only. iOS `.app` handling shells out to
+Apple system tools. APK handling uses Android SDK `apkanalyzer` and `apksigner`
+when available, either discovered from the SDK environment or passed
+explicitly. Missing automatically discovered tools produce warnings and skip
+only the checks owned by those tools.
 
 ## The one thing that will trip you up
 
@@ -45,8 +48,10 @@ ask first.
 
 Three things to sort out before running.
 
-**Find the build.** Prefer an `.ipa`. Otherwise a device `.app`, which the tool
-packages for you without re-signing. Common locations:
+**Find the build.** For iOS, prefer an `.ipa`; otherwise use a device `.app`,
+which the tool packages without re-signing. For Android, use a signed standalone
+`.apk`. `.aab`, `.apks`, and individual split APK files are not browser-installable
+inputs and should be reported rather than converted implicitly. Common locations:
 
 - `~/Library/Developer/Xcode/DerivedData/<App>-<hash>/Build/Products/Debug-iphoneos/<App>.app`
 - an `.xcarchive`'s `Products/Applications/<App>.app`
@@ -63,6 +68,9 @@ a source checkout or binary path.
 
 **Check `cloudflared` is installed** (`brew install cloudflared`) unless the
 user wants `--provider tailscale`. No Cloudflare account is needed.
+
+For APKs, ensure Android SDK Command-Line Tools and Build Tools are installed.
+If automatic discovery fails, pass `--apkanalyzer-bin` and `--apksigner-bin`.
 
 ## Running it
 
@@ -122,11 +130,14 @@ Install page: https://<random>.trycloudflare.com/install/artifact-<uuid>
 Install link: itms-services://?action=download-manifest&url=...
 ```
 
+For Android, `Requires` contains an API level and `Install link` is the granted
+HTTPS `download.apk` URL. Give the user the install page in either case.
+
 Give the user the **Install page** URL. That's the one to open on the phone and
 the one to paste into a message.
 
 The QR code is terminal art printed below that banner. Don't try to reproduce
-it in your reply — say it's in their terminal and to scan it with the iPhone
+it in your reply — say it's in their terminal and to scan it with the phone
 camera app. If they're working from a different machine than the one running
 the command, the URL is what they need.
 
@@ -162,8 +173,13 @@ second with nothing exposed. Each is a real problem with the build:
 | `does not allow bundle identifier`                   | Profile is for a different app | Export with the matching profile                                        |
 | `macOS .app bundles cannot be installed on iOS`      | Wrong platform                 | Build for the iphoneos SDK                                              |
 | `CLI was not found`                                  | Missing tunnel binary          | `brew install cloudflared`, or pass `--cloudflared-bin`                 |
+| Warning: `apkanalyzer was not found`                 | Metadata and split checks skipped | Install SDK Command-Line Tools or pass `--apkanalyzer-bin`           |
+| Warning: `apksigner was not found`                   | Signature verification skipped | Install SDK Build Tools or pass `--apksigner-bin`                      |
+| `APK split packages are not supported`               | Not a standalone APK           | Build a signed universal/standalone APK                                 |
 
-`--allow-unsigned` exists, but reach for it only when the user explicitly asks.
+`--allow-unsigned` exists for IPA input only. APK signatures are verified when
+`apksigner` is available; without it the CLI emits a prominent warning.
+Reach for the flag only when the user explicitly asks.
 It fixes nothing — it moves a failure caught in one second on the Mac to a
 failure the recipient hits after downloading hundreds of megabytes, where the
 only diagnostic is iOS saying "Unable to Install". Say that plainly instead of
@@ -176,8 +192,10 @@ nearly always the provisioning profile not listing that device's UDID. Getting
 the device registered means a rebuild — there is nothing to change on this
 side.
 
-If the page loads but tapping Install does nothing, they're probably in a
-third-party browser. `itms-services://` needs Safari.
+If an iOS page loads but tapping Install does nothing, use Safari because
+`itms-services://` is handled there. On Android, open the downloaded APK; the
+system may require enabling “Install unknown apps” for that browser. An update
+also requires the same signing certificate as the installed app.
 
 ## Worth telling the user once
 

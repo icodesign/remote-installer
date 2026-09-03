@@ -49,7 +49,12 @@ async fn a_spent_quota_leaves_the_install_page_and_icon_readable() {
     assert!(!body.contains("itms-services://"), "{body}");
     // The build is still identified, so the reader knows they are in the
     // right place and which build ran out.
-    assert!(body.contains(&server.artifact.bundle_identifier), "{body}");
+    let remote_installer::model::PlatformMetadata::Ios(metadata) =
+        &server.artifact.platform_metadata
+    else {
+        panic!("fixture should be an iOS artifact");
+    };
+    assert!(body.contains(&metadata.bundle_identifier), "{body}");
 
     let icon = client
         .get(server.url(&format!(

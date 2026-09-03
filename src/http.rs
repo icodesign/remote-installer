@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -8,12 +9,13 @@ use http_body_util::{BodyExt, Empty, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::header::{
     ACCEPT_RANGES, ALLOW, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
-    CONTENT_TYPE, HeaderValue, RANGE,
+    CONTENT_TYPE, HeaderValue, RANGE, USER_AGENT,
 };
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as ConnectionBuilder;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::AsyncSeekExt;
 use tokio::net::TcpListener;
@@ -31,11 +33,11 @@ type ResponseBody = http_body_util::combinators::BoxBody<Bytes, BoxError>;
 /// idle sockets can exhaust the process and stall a real OTA download.
 const MAX_CONNECTIONS: usize = 256;
 /// How long a client may take to send its request head before being dropped.
-/// Bodies and responses are deliberately not capped: an IPA download over a
+/// Bodies and responses are deliberately not capped: a package download over a
 /// slow phone connection is legitimately long-lived.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long shutdown waits for in-flight requests. A phone part-way through a
-/// 200 MB IPA download should not have the socket pulled out from under it
+/// 200 MB package download should not have the socket pulled out from under it
 /// because someone pressed Ctrl-C.
 const GRACEFUL_DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
 /// Minimum time between two progress lines for one download: frequent enough
@@ -58,13 +60,13 @@ pub enum HttpError {
     RangeNotSatisfiable,
 }
 
-/// The origin serves only the four public OTA resources needed by an iPhone.
+/// The origin serves only the public resources needed by the two install flows.
 /// Artifact management, uploads, device installation, and health APIs belong
 /// to the removed long-running `serve` product and are intentionally absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Resource {
     Manifest(String),
-    Download(String),
+    Download { id: String, extension: String },
     Icon(String),
     InstallPage(String),
 }
@@ -90,8 +92,13 @@ fn route(method: &Method, path: &str) -> Route {
         ["api", "v1", "artifacts", id, "manifest.plist"] => {
             Some(Resource::Manifest((*id).to_string()))
         }
-        ["api", "v1", "artifacts", id, "download.ipa"] => {
-            Some(Resource::Download((*id).to_string()))
+        ["api", "v1", "artifacts", id, download]
+            if matches!(*download, "download.ipa" | "download.apk") =>
+        {
+            Some(Resource::Download {
+                id: (*id).to_string(),
+                extension: download.trim_start_matches("download.").to_string(),
+            })
         }
         ["api", "v1", "artifacts", id, "icon.png"] => Some(Resource::Icon((*id).to_string())),
         ["install", id] => Some(Resource::InstallPage((*id).to_string())),
@@ -110,12 +117,13 @@ impl HttpState {
     pub async fn handle(
         &self,
         request: Request<Incoming>,
+        peer: SocketAddr,
     ) -> Result<Response<ResponseBody>, Infallible> {
         // Decided once, up front: whichever path produces the response below
         // (success or error), a HEAD request must end up with an empty body.
         let is_head = request.method() == Method::HEAD;
         let route = route(request.method(), request.uri().path());
-        let response = match self.dispatch(route, is_head, request).await {
+        let response = match self.dispatch(route, is_head, request, peer).await {
             Ok(response) => response,
             Err(error) => error_response(error),
         };
@@ -131,10 +139,14 @@ impl HttpState {
         route: Route,
         is_head: bool,
         request: Request<Incoming>,
+        peer: SocketAddr,
     ) -> Result<Response<ResponseBody>, HttpError> {
         match route {
             Route::Found(Resource::Manifest(id)) => {
-                let artifact = self.service.servable_artifact(&id)?;
+                // `manifest.plist` is an iOS resource. Resolve identity here;
+                // `manifest` then checks platform before it checks availability,
+                // so an Android artifact never appears to have this route.
+                let artifact = self.service.viewable_artifact(&id)?;
                 let mut response = text_response(
                     StatusCode::OK,
                     "application/xml; charset=utf-8",
@@ -143,7 +155,9 @@ impl HttpState {
                 no_store(&mut response);
                 Ok(response)
             }
-            Route::Found(Resource::Download(id)) => self.download(&id, is_head, request).await,
+            Route::Found(Resource::Download { id, extension }) => {
+                self.download(&id, &extension, is_head, request, peer).await
+            }
             Route::Found(Resource::Icon(id)) => self.icon_download(&id).await,
             Route::Found(Resource::InstallPage(id)) => self.install_page(&id).await,
             Route::MethodNotAllowed => Ok(method_not_allowed_response()),
@@ -157,9 +171,15 @@ impl HttpState {
     async fn download(
         &self,
         artifact_id: &str,
+        extension: &str,
         is_head: bool,
         request: Request<Incoming>,
+        peer: SocketAddr,
     ) -> Result<Response<ResponseBody>, HttpError> {
+        let described_artifact = self.service.viewable_artifact(artifact_id)?;
+        if described_artifact.download_extension() != extension {
+            return Err(ServiceError::NotFound("artifact download not found".into()).into());
+        }
         if is_head {
             // A HEAD must report the same headers a GET would without
             // spending one of the user's --max-downloads attempts, so it
@@ -172,7 +192,15 @@ impl HttpState {
             // `HttpState::handle` discards this body via `empty_body` right
             // after it is built, so a reporter attached here would see every
             // HEAD request as an interrupted download.
-            return file_response(path, &artifact.file_name, None, false).await;
+            return file_response(
+                path,
+                &artifact.file_name,
+                artifact.download_content_type(),
+                None,
+                false,
+                None,
+            )
+            .await;
         }
         let grant_token = query_param(request.uri().query(), "download");
         let artifact = self
@@ -185,13 +213,28 @@ impl HttpState {
             .get(RANGE)
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned);
+        let identity = DownloadIdentity::from_request(&request, peer, &artifact.id);
         tracing::info!(
+            request_id = %identity.request_id,
+            client_id = %identity.client_id,
+            client_ip = %identity.client_ip,
+            client_ip_source = identity.client_ip_source,
+            user_agent = %identity.user_agent,
             artifact_id = %artifact.id,
             file_name = %artifact.file_name,
             range = ?range,
-            "IPA download started"
+            platform = ?artifact.platform(),
+            "package download started"
         );
-        file_response(path, &artifact.file_name, range.as_deref(), true).await
+        file_response(
+            path,
+            &artifact.file_name,
+            artifact.download_content_type(),
+            range.as_deref(),
+            true,
+            Some(identity),
+        )
+        .await
     }
 
     async fn icon_download(&self, artifact_id: &str) -> Result<Response<ResponseBody>, HttpError> {
@@ -202,11 +245,16 @@ impl HttpState {
 
     async fn install_page(&self, artifact_id: &str) -> Result<Response<ResponseBody>, HttpError> {
         let artifact = self.service.viewable_artifact(artifact_id)?;
-        let itms_url = self.service.itms_services_url(artifact);
+        let install_action_url = match self.service.availability() {
+            crate::model::Availability::Installable => {
+                self.service.install_action_url(artifact).await?
+            }
+            _ => String::new(),
+        };
         let icon_url = self.service.icon_url(artifact);
         let html = install_page::render(
             artifact,
-            &itms_url,
+            &install_action_url,
             icon_url.as_deref(),
             self.service.availability(),
         );
@@ -263,7 +311,7 @@ pub async fn run_listener(
     }
 }
 
-/// Stop accepting and wait for every live connection to finish, so an IPA
+/// Stop accepting and wait for every live connection to finish, so a package
 /// download in progress is allowed to complete.
 async fn drain(connections: &Semaphore) {
     let in_flight = MAX_CONNECTIONS - connections.available_permits();
@@ -341,7 +389,7 @@ async fn accept_loop(
                     .header_read_timeout(HEADER_READ_TIMEOUT);
                 let service = service_fn(move |request| {
                     let state = state.clone();
-                    async move { state.handle(request).await }
+                    async move { state.handle(request, peer).await }
                 });
                 let connection = connection_builder.serve_connection(TokioIo::new(stream), service);
                 tokio::pin!(connection);
@@ -489,7 +537,112 @@ fn content_disposition_value(file_name: &str) -> String {
     }
 }
 
-/// Tracks one IPA transfer so the person who ran `share` can watch it happen.
+/// Correlation fields for one package response.
+///
+/// `client_id` is a short hash of the share ID, observed IP, and User-Agent. It
+/// is useful for grouping logs during this share only; NAT, privacy relays, and
+/// shared User-Agents mean it must never be treated as authentication or a
+/// durable device identifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DownloadIdentity {
+    request_id: String,
+    client_id: String,
+    client_ip: IpAddr,
+    client_ip_source: &'static str,
+    user_agent: String,
+}
+
+impl DownloadIdentity {
+    fn from_request<B>(request: &Request<B>, peer: SocketAddr, share_id: &str) -> Self {
+        let (client_ip, client_ip_source) = observed_client_ip(request, peer);
+        let user_agent = request
+            .headers()
+            .get(USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| {
+                value
+                    .chars()
+                    .filter(|character| !character.is_control())
+                    .take(256)
+                    .collect()
+            })
+            .filter(|value: &String| !value.is_empty())
+            .unwrap_or_else(|| "unknown".into());
+        let mut hasher = Sha256::new();
+        hasher.update(share_id.as_bytes());
+        hasher.update([0]);
+        hasher.update(client_ip.to_string().as_bytes());
+        hasher.update([0]);
+        hasher.update(user_agent.as_bytes());
+        let client_id = hasher
+            .finalize()
+            .iter()
+            .take(6)
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let request_id = uuid::Uuid::new_v4()
+            .simple()
+            .to_string()
+            .chars()
+            .take(12)
+            .collect();
+        Self {
+            request_id,
+            client_id,
+            client_ip,
+            client_ip_source,
+            user_agent,
+        }
+    }
+
+    fn progress_context(&self) -> String {
+        format!(
+            "request={} client={} ip={}",
+            self.request_id, self.client_id, self.client_ip
+        )
+    }
+
+    #[cfg(test)]
+    fn test() -> Self {
+        Self {
+            request_id: "request-1".into(),
+            client_id: "client-1".into(),
+            client_ip: "192.0.2.10".parse().unwrap(),
+            client_ip_source: "peer",
+            user_agent: "test-agent".into(),
+        }
+    }
+}
+
+fn observed_client_ip<B>(request: &Request<B>, peer: SocketAddr) -> (IpAddr, &'static str) {
+    for (header, source) in [
+        ("cf-connecting-ip", "cf-connecting-ip"),
+        ("x-forwarded-for", "x-forwarded-for"),
+        ("x-real-ip", "x-real-ip"),
+    ] {
+        let Some(value) = request
+            .headers()
+            .get(header)
+            .and_then(|value| value.to_str().ok())
+        else {
+            continue;
+        };
+        if let Some(ip) = value.split(',').find_map(parse_client_ip) {
+            return (ip, source);
+        }
+    }
+    (peer.ip(), "peer")
+}
+
+fn parse_client_ip(value: &str) -> Option<IpAddr> {
+    let value = value.trim();
+    value
+        .parse::<IpAddr>()
+        .ok()
+        .or_else(|| value.parse::<SocketAddr>().ok().map(|address| address.ip()))
+}
+
+/// Tracks one package transfer so the person who ran `share` can watch it happen.
 ///
 /// After the QR code is printed the terminal would otherwise go silent for the
 /// entire download, leaving no way to tell a phone pulling 200 MB from a phone
@@ -501,6 +654,7 @@ fn content_disposition_value(file_name: &str) -> String {
 /// bookkeeping to keep in sync.
 struct DownloadProgress {
     file_name: String,
+    identity: DownloadIdentity,
     /// Bytes this response promised, which for a `Range` request is the length
     /// of the range rather than of the file.
     expected: u64,
@@ -513,9 +667,16 @@ struct DownloadProgress {
 }
 
 impl DownloadProgress {
-    fn new(file_name: &str, expected: u64, is_range: bool, now: Instant) -> Self {
+    fn new(
+        file_name: &str,
+        expected: u64,
+        is_range: bool,
+        now: Instant,
+        identity: DownloadIdentity,
+    ) -> Self {
         Self {
             file_name: file_name.to_string(),
+            identity,
             expected,
             is_range,
             started: now,
@@ -532,8 +693,9 @@ impl DownloadProgress {
             self.finished = true;
             let scope = if self.is_range { " range" } else { "" };
             return Some(format!(
-                "Download complete: {} ({}{scope} in {})",
+                "Download complete: {} [{}] ({}{scope} in {})",
                 self.file_name,
+                self.identity.progress_context(),
                 format_bytes(self.sent),
                 format_elapsed(now.saturating_duration_since(self.started)),
             ));
@@ -545,8 +707,9 @@ impl DownloadProgress {
         }
         self.last_report = now;
         Some(format!(
-            "Downloading {}: {}% ({} / {})",
+            "Downloading {} [{}]: {}% ({} / {})",
             self.file_name,
+            self.identity.progress_context(),
             self.percent(),
             format_bytes(self.sent),
             format_bytes(self.expected),
@@ -560,8 +723,9 @@ impl DownloadProgress {
             return None;
         }
         Some(format!(
-            "Download interrupted: {} at {}% ({} / {})",
+            "Download interrupted: {} [{}] at {}% ({} / {})",
             self.file_name,
+            self.identity.progress_context(),
             self.percent(),
             format_bytes(self.sent),
             format_bytes(self.expected),
@@ -596,8 +760,10 @@ fn format_elapsed(elapsed: Duration) -> String {
 async fn file_response(
     path: PathBuf,
     file_name: &str,
+    content_type: &'static str,
     range_header: Option<&str>,
     report_progress: bool,
+    identity: Option<DownloadIdentity>,
 ) -> Result<Response<ResponseBody>, HttpError> {
     let mut file = tokio::fs::File::open(&path).await?;
     let total = file.metadata().await?.len();
@@ -616,8 +782,13 @@ async fn file_response(
     // A HEAD has its body discarded by `empty_body`, so instrumenting it would
     // report a download that never happened.
     let body = if report_progress {
-        let mut progress =
-            DownloadProgress::new(file_name, length, range.is_some(), Instant::now());
+        let mut progress = DownloadProgress::new(
+            file_name,
+            length,
+            range.is_some(),
+            Instant::now(),
+            identity.expect("download progress requires request identity"),
+        );
         StreamBody::new(futures_util::StreamExt::map(
             reader_stream,
             move |chunk| -> Result<Frame<Bytes>, BoxError> {
@@ -648,10 +819,9 @@ async fn file_response(
             response.headers_mut().insert(CONTENT_RANGE, value);
         }
     }
-    response.headers_mut().insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("application/octet-stream"),
-    );
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
     // iOS renders a real progress ring during OTA installation only when it
     // knows the size up front, and Accept-Ranges lets an interrupted download
     // resume instead of restarting.
@@ -667,7 +837,7 @@ async fn file_response(
             .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
     );
     // Quota enforcement happens in this process. Do not let a tunnel or
-    // intermediary replay a cached IPA without reaching `authorize_download`.
+    // intermediary replay a cached package without reaching `authorize_download`.
     response
         .headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -808,9 +978,16 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), b"0123456789").unwrap();
 
-        let whole = file_response(file.path().to_path_buf(), "App.ipa", None, false)
-            .await
-            .unwrap();
+        let whole = file_response(
+            file.path().to_path_buf(),
+            "App.ipa",
+            "application/octet-stream",
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(whole.status(), StatusCode::OK);
         assert_eq!(whole.headers()[CONTENT_LENGTH], "10");
         assert_eq!(whole.headers()[ACCEPT_RANGES], "bytes");
@@ -819,8 +996,10 @@ mod tests {
         let partial = file_response(
             file.path().to_path_buf(),
             "App.ipa",
+            "application/octet-stream",
             Some("bytes=2-5"),
             false,
+            None,
         )
         .await
         .unwrap();
@@ -833,8 +1012,10 @@ mod tests {
         let suffix = file_response(
             file.path().to_path_buf(),
             "App.ipa",
+            "application/octet-stream",
             Some("bytes=-3"),
             false,
+            None,
         )
         .await
         .unwrap();
@@ -844,8 +1025,10 @@ mod tests {
         let unsatisfiable = file_response(
             file.path().to_path_buf(),
             "App.ipa",
+            "application/octet-stream",
             Some("bytes=99-"),
             false,
+            None,
         )
         .await;
         assert!(matches!(unsatisfiable, Err(HttpError::RangeNotSatisfiable)));
@@ -922,9 +1105,16 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), b"0123456789").unwrap();
 
-        let get = file_response(file.path().to_path_buf(), "App.ipa", None, false)
-            .await
-            .unwrap();
+        let get = file_response(
+            file.path().to_path_buf(),
+            "App.ipa",
+            "application/octet-stream",
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
         let content_length = get.headers()[CONTENT_LENGTH].clone();
         let content_type = get.headers()[CONTENT_TYPE].clone();
 
@@ -936,7 +1126,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_four_ota_resources_are_exposed() {
+    fn only_install_resources_are_exposed() {
         assert!(matches!(
             route(&Method::GET, "/install/artifact-1"),
             Route::Found(Resource::InstallPage(_))
@@ -947,7 +1137,11 @@ mod tests {
         ));
         assert!(matches!(
             route(&Method::GET, "/api/v1/artifacts/artifact-1/download.ipa"),
-            Route::Found(Resource::Download(_))
+            Route::Found(Resource::Download { .. })
+        ));
+        assert!(matches!(
+            route(&Method::GET, "/api/v1/artifacts/artifact-1/download.apk"),
+            Route::Found(Resource::Download { .. })
         ));
         assert!(matches!(
             route(&Method::GET, "/api/v1/artifacts/artifact-1/manifest.plist"),
@@ -967,6 +1161,7 @@ mod tests {
             "/install/artifact-1",
             "/api/v1/artifacts/artifact-1/icon.png",
             "/api/v1/artifacts/artifact-1/download.ipa",
+            "/api/v1/artifacts/artifact-1/download.apk",
             "/api/v1/artifacts/artifact-1/manifest.plist",
         ] {
             assert!(
@@ -983,14 +1178,59 @@ mod tests {
     }
 
     #[test]
+    fn download_identity_prefers_proxy_ip_and_stably_groups_the_same_client() {
+        let request = Request::builder()
+            .header("cf-connecting-ip", "198.51.100.24")
+            .header("x-forwarded-for", "203.0.113.8")
+            .header(USER_AGENT, "Android DownloadManager/14")
+            .body(())
+            .unwrap();
+        let peer = "127.0.0.1:54321".parse().unwrap();
+
+        let first = DownloadIdentity::from_request(&request, peer, "artifact-1");
+        let second = DownloadIdentity::from_request(&request, peer, "artifact-1");
+        let another_share = DownloadIdentity::from_request(&request, peer, "artifact-2");
+
+        assert_eq!(first.client_ip, "198.51.100.24".parse::<IpAddr>().unwrap());
+        assert_eq!(first.client_ip_source, "cf-connecting-ip");
+        assert_eq!(first.user_agent, "Android DownloadManager/14");
+        assert_eq!(first.client_id, second.client_id);
+        assert_ne!(first.client_id, another_share.client_id);
+        assert_ne!(first.request_id, second.request_id);
+    }
+
+    #[test]
+    fn download_identity_falls_back_to_peer_and_user_agent_separates_clients() {
+        let peer = "192.0.2.44:54321".parse().unwrap();
+        let browser = Request::builder()
+            .header(USER_AGENT, "Chrome Mobile")
+            .body(())
+            .unwrap();
+        let manager = Request::builder()
+            .header(USER_AGENT, "Android DownloadManager")
+            .body(())
+            .unwrap();
+
+        let browser = DownloadIdentity::from_request(&browser, peer, "artifact-1");
+        let manager = DownloadIdentity::from_request(&manager, peer, "artifact-1");
+
+        assert_eq!(browser.client_ip, peer.ip());
+        assert_eq!(browser.client_ip_source, "peer");
+        assert_ne!(browser.client_id, manager.client_id);
+    }
+
+    #[test]
     fn a_completed_download_reports_completion_once_and_never_interruption() {
         let start = Instant::now();
-        let mut progress = DownloadProgress::new("App.ipa", 10, false, start);
+        let mut progress =
+            DownloadProgress::new("App.ipa", 10, false, start, DownloadIdentity::test());
 
         assert_eq!(progress.record(4, start), None);
         let line = progress.record(6, start).expect("completion line");
         assert!(
-            line.starts_with("Download complete: App.ipa (10 B in "),
+            line.starts_with(
+                "Download complete: App.ipa [request=request-1 client=client-1 ip=192.0.2.10] (10 B in "
+            ),
             "{line}"
         );
         // Completion is emitted exactly once, and a dropped body stays quiet.
@@ -1001,19 +1241,23 @@ mod tests {
     #[test]
     fn an_abandoned_download_reports_where_it_stopped() {
         let start = Instant::now();
-        let mut progress = DownloadProgress::new("App.ipa", 1000, false, start);
+        let mut progress =
+            DownloadProgress::new("App.ipa", 1000, false, start, DownloadIdentity::test());
         progress.record(620, start);
 
         assert_eq!(
             progress.interrupted().as_deref(),
-            Some("Download interrupted: App.ipa at 62% (620 B / 1.0 KB)")
+            Some(
+                "Download interrupted: App.ipa [request=request-1 client=client-1 ip=192.0.2.10] at 62% (620 B / 1.0 KB)"
+            )
         );
     }
 
     #[test]
     fn progress_lines_are_rate_limited() {
         let start = Instant::now();
-        let mut progress = DownloadProgress::new("App.ipa", 1_000_000, false, start);
+        let mut progress =
+            DownloadProgress::new("App.ipa", 1_000_000, false, start, DownloadIdentity::test());
 
         // Two chunks milliseconds apart are one transfer, not two lines.
         assert_eq!(
@@ -1027,7 +1271,10 @@ mod tests {
 
         let later = start + PROGRESS_REPORT_INTERVAL + Duration::from_millis(1);
         let line = progress.record(448_000, later).expect("progress line");
-        assert_eq!(line, "Downloading App.ipa: 45% (450.0 KB / 1.0 MB)");
+        assert_eq!(
+            line,
+            "Downloading App.ipa [request=request-1 client=client-1 ip=192.0.2.10]: 45% (450.0 KB / 1.0 MB)"
+        );
         // ...and the next chunk right after it is rate-limited again.
         assert_eq!(progress.record(1_000, later), None);
     }
@@ -1035,7 +1282,8 @@ mod tests {
     #[test]
     fn a_range_response_reports_against_the_range_not_the_file() {
         let start = Instant::now();
-        let mut progress = DownloadProgress::new("App.ipa", 4_000_000, true, start);
+        let mut progress =
+            DownloadProgress::new("App.ipa", 4_000_000, true, start, DownloadIdentity::test());
         let line = progress.record(4_000_000, start).expect("completion line");
         assert!(line.contains("4.0 MB range in"), "{line}");
     }
@@ -1044,7 +1292,7 @@ mod tests {
     #[test]
     fn an_empty_response_reports_nothing() {
         let start = Instant::now();
-        let progress = DownloadProgress::new("App.ipa", 0, false, start);
+        let progress = DownloadProgress::new("App.ipa", 0, false, start, DownloadIdentity::test());
         assert_eq!(progress.interrupted(), None);
     }
 
@@ -1053,9 +1301,16 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), b"0123456789").unwrap();
 
-        let reported = file_response(file.path().to_path_buf(), "App.ipa", None, true)
-            .await
-            .unwrap();
+        let reported = file_response(
+            file.path().to_path_buf(),
+            "App.ipa",
+            "application/octet-stream",
+            None,
+            true,
+            Some(DownloadIdentity::test()),
+        )
+        .await
+        .unwrap();
         assert_eq!(reported.headers()[CONTENT_LENGTH], "10");
         let body = reported.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body.as_ref(), b"0123456789");

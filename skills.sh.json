@@ -3,7 +3,7 @@
   "notGrouped": "bottom",
   "groupings": [
     {
-      "title": "iOS distribution",
+      "title": "Mobile distribution",
       "description": "Getting builds onto real devices without TestFlight or a cable.",
       "skills": ["remote-installer"]
     }
