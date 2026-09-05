@@ -72,7 +72,7 @@ struct ShareArgs {
     /// Same as --timeout, but with a unit: `90s`, `30m`, `2h`, `7d`.
     #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
     expire_after: Option<Duration>,
-    /// Stop sharing after this many OTA download attempts.
+    /// Stop sharing after this many successful OTA downloads.
     #[arg(long, value_name = "COUNT")]
     max_downloads: Option<u64>,
     /// Tunnel provider (`tailscale` is an alias for `tailscale-funnel`).

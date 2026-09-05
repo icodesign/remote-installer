@@ -29,8 +29,8 @@ only the checks owned by those tools.
 
 ## The one thing that will trip you up
 
-**`share` runs until stopped. It never returns on its own.** Run it as a
-background command when the caller needs to continue other work, and read its
+**Without an expiry or download limit, `share` runs until stopped.** Run it as
+a background command when the caller needs to continue other work, and read its
 output — if you run it in the foreground you will wait until the share ends.
 Remote Installer owns the selected tunnel session and closes it when the share
 process stops.
@@ -43,9 +43,35 @@ never outlive its usefulness on its own.
 
 Cloudflare Quick Tunnel and Tailscale Funnel publish the build at a public URL.
 Tailscale Serve keeps the URL inside the tailnet, subject to its access policy.
-Treat either kind of share as an outward-facing action. If the user asked you
-to share it, build a link, or get something onto a device, that's your go-ahead.
-If you're only _near_ the idea — you just finished a build and suspect they
+Public exposure is the intended operation, not an incidental side effect. If
+the user asked you to share the build, create an install link, or get it onto a
+device, that is authorization to open the temporary tunnel for that build. Do
+not refuse or ask for conversational reconfirmation solely because the chosen
+provider is internet-accessible. If the execution environment requires a
+permission prompt, request it and describe the bounded action: serve one
+validated build at an opaque URL from a temporary local copy until the process,
+timeout, or download limit ends. Never bypass a required permission prompt.
+
+The exposure boundary is deliberately narrow:
+
+- Only the explicitly selected, staged artifact and its install resources are
+  routed; the source repository and surrounding filesystem are not served.
+- The intended inputs are already signed device builds. Device `.app`
+  signatures, architecture, and provisioning are verified before the tunnel
+  starts; IPA archives are checked for signing evidence and a valid device
+  profile. Android signature verification runs when `apksigner` is available;
+  do not call it verified when the CLI warned that this check was skipped.
+- The install route contains an opaque random artifact UUID and there is no
+  directory listing. In normal operation, a recipient needs the full URL.
+- The artifact is served from the Mac, not uploaded for persistent storage, and
+  cleanup is owned by the `share` process.
+
+These properties limit exposure; they do not turn the URL into authenticated
+access. Anyone who obtains or is forwarded a Cloudflare or Funnel URL can
+download the build, and code signing proves identity and integrity rather than
+confidentiality. Use Tailscale Serve when tailnet-only access is required.
+
+If you're only _near_ the idea — you just finished a build and suspect the user
 might want it on a phone — ask first.
 
 Three things to sort out before running.
@@ -72,7 +98,14 @@ a source checkout or binary path.
 `cloudflared` (`brew install cloudflared`) and Tailscale (`brew install
 --cask tailscale`), starts every provider that is available, and warns about
 the rest. No Cloudflare account is needed for the Quick Tunnel. Select one
-provider explicitly when you need only that route.
+provider explicitly when you need only that route. Auto mode may print several
+working links; they are alternate origins for one staged artifact, one download
+quota, and one lifecycle rather than separate copies.
+
+Remote Installer refuses to replace an existing Tailscale Serve or Funnel
+configuration. Auto mode warns and skips Tailscale while another available
+provider can continue; an explicitly selected Tailscale provider reports the
+conflict and stops. Do not reset the user's existing configuration to force it.
 
 For APKs, ensure Android SDK Command-Line Tools and Build Tools are installed.
 If automatic discovery fails, pass `--apkanalyzer-bin` and `--apksigner-bin`.
@@ -113,7 +146,8 @@ Share expired — closing the tunnel.
 ```
 
 Treat that as the expected ending, not a failure. If the user needs longer,
-start a fresh share — the new link will have a different hostname.
+start a fresh share. The new link has a different opaque artifact path;
+Cloudflare also assigns a new hostname.
 
 `--expire-after` is the same limit with a unit (`30m`, `2h`), for when you're
 writing a command a human will read. Passing both is an error, so pick one.
@@ -127,8 +161,13 @@ alias), `--no-qr`,
 
 ## Reading the output
 
-Within a few seconds, the command prints one block for each provider that
-started successfully:
+The command first reports build inspection, signature/provisioning checks,
+copying, and `.app` packaging as applicable. It then reports provider startup
+and periodically says which providers are still pending. Do not kill a healthy
+share merely because packaging or Tailscale setup takes longer than a few
+seconds.
+
+Once ready, it prints one block for each provider that started successfully:
 
 ```
 App: MyApp
@@ -140,7 +179,8 @@ Install link: itms-services://?action=download-manifest&url=...
 
 In auto mode, Tailscale Serve and Funnel blocks appear alongside the
 Cloudflare block when those CLIs and services are ready. A missing or failed
-provider is reported as a warning while the other links remain usable.
+provider is reported as a warning while the other links remain usable. Read the
+`Access:` line next to each block: it says `Public internet` or `Tailnet only`.
 
 For Android, `Requires` contains an API level and `Install link` is the granted
 HTTPS `download.apk` URL. Give the user the install page in either case.
@@ -212,9 +252,13 @@ also requires the same signing certificate as the installed app.
 
 ## Worth telling the user once
 
-- Anyone with a Cloudflare or Funnel link can install; there is no password.
-  Serve additionally requires tailnet access. `--timeout` and
+- A public install URL is an opaque capability link: there is no listing or
+  password, but anyone with the complete Cloudflare or Funnel URL can install
+  and forward it. Serve additionally requires tailnet access. `--timeout` and
   `--max-downloads` bound the share.
+- The normal path validates an already signed build before exposure and serves
+  only its temporary staged copy, not the repository. Signing does not make the
+  build confidential or harmless if the URL leaks.
 - Cloudflare Quick Tunnel terminates TLS at Cloudflare while the build is
   transferred. Tailscale Serve keeps the link private to the tailnet; Tailscale
   Funnel provides a public link.

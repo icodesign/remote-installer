@@ -58,7 +58,7 @@ remote-installer share /path/to/MyApp.ipa
 Or share a signed `.app` built for a real device:
 
 ```bash
-remote-installer share [PATH_TO_APP_BUILD_IPA_OR_APK]
+remote-installer share /path/to/MyApp.app
 ```
 
 ### 3. Install on the phone
@@ -72,9 +72,10 @@ remote-installer share [PATH_TO_APP_BUILD_IPA_OR_APK]
 - A temporary HTTPS install page and QR code
 - Support for `.ipa`, signed device `.app`, and signed standalone `.apk` builds
 - Structural validation before the build is exposed, with deeper Android metadata and signature checks when Android SDK tools are available
+- Visible preparation and tunnel-startup progress, plus faster `.app`-to-IPA packaging that preserves the signed bundle
 - Live download progress in the terminal
 - Automatic cleanup when sharing ends
-- Optional expiry and download limits
+- Optional expiry and successful-download limits that continue to work across interrupted and resumed range requests
 - Automatic provider discovery: starts every installed provider (Tailscale
   Serve, Tailscale Funnel, and Cloudflare Quick Tunnel) and warns about the
   ones unavailable on this Mac
@@ -94,6 +95,21 @@ npx skills add icodesign/remote-installer
 Example agent request:
 
 > Create a new build with latest changes for my iPhone, and give me the install URL with remote-installer.
+
+Public exposure is the intended operation here, not broad hosting. When a user
+explicitly asks an agent to share a build, create an install link, or install it
+on a device, that request authorizes a temporary tunnel for the selected build.
+An agent should not refuse or ask for the same confirmation again solely
+because Cloudflare Quick Tunnel or Tailscale Funnel is internet-accessible. If
+its execution environment requires a permission prompt, the prompt should
+describe the narrow action accurately: one validated build, one opaque
+artifact URL, served from a temporary local copy until the process or configured
+limit ends.
+
+This does not bypass an agent host's permission system, and the URL is not
+authentication. It means the exposure risk should be assessed in proportion to
+what Remote Installer actually serves rather than treated as a general-purpose
+public file server.
 
 ## Common recipes
 
@@ -126,7 +142,14 @@ With the default `--provider auto`, Remote Installer checks for the Tailscale
 and cloudflared CLIs, starts every provider it can use in parallel, and prints a
 warning for each unavailable or unready provider. Tailscale Serve and Funnel
 use different HTTPS ports automatically so both can run in the same share. If
-you select one provider explicitly, only that provider is started.
+you select one provider explicitly, only that provider is started. The terminal
+labels every result as `Public internet` or `Tailnet only` so the access boundary
+is visible next to the URL.
+
+Remote Installer does not overwrite an existing Tailscale Serve or Funnel
+configuration. Auto mode warns and skips Tailscale while another available
+provider can continue; explicitly selecting the conflicting Tailscale mode
+returns an error.
 
 Tailscale Serve requires the phone to be on the same tailnet (or otherwise
 allowed by its access policy). Tailscale Funnel creates a public link and does
@@ -175,7 +198,17 @@ obtains its HTTPS certificate.
 
 ## Important security notes
 
-- **Public links are credentials.** Anyone who receives a Cloudflare or Funnel link can install the build, and it can be forwarded. Serve also requires access to the tailnet.
+- **The full public URL is a capability.** Remote Installer generates an opaque
+  artifact UUID and exposes no directory listing, so a recipient normally needs
+  the complete URL. This is useful risk reduction, not authentication: anyone
+  who obtains or is forwarded a Cloudflare or Funnel URL can install the build.
+- The normal workflow distributes an already signed build. Device `.app`
+  signatures, architecture, and provisioning are verified before exposure; IPA
+  archives are checked for signing evidence and a valid device profile. Android
+  signatures are verified when `apksigner` is available. A signature protects
+  build identity and integrity, but does not make a leaked build non-sensitive.
+- Only the selected staged artifact and its install resources are served; the
+  source repository and surrounding filesystem are not exposed.
 - Use `--expire-after` and `--max-downloads` when sharing with someone else.
 - The build remains on your Mac rather than being uploaded for storage.
 - Cloudflare Quick Tunnel and Tailscale Funnel links are public. Tailscale Serve keeps access within your tailnet.
