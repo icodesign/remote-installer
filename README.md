@@ -26,9 +26,12 @@ Remote Installer validates the build, opens a temporary HTTPS link, and prints a
 ### 1. Install
 
 ```bash
-# Install cloudflared for quick tunnels
-# It does NOT require Cloudflare account.
+# Install one or more tunnel providers. The default auto mode starts every
+# provider installed on this Mac and warns about providers that are unavailable.
+# cloudflared does NOT require a Cloudflare account for Quick Tunnels.
 brew install cloudflared
+# Optional: install Tailscale for private tailnet links and public Funnel links
+brew install --cask tailscale
 # Install remote-installer
 # with homebrew
 brew install icodesign/tap/remote-installer
@@ -72,7 +75,9 @@ remote-installer share [PATH_TO_APP_BUILD_IPA_OR_APK]
 - Live download progress in the terminal
 - Automatic cleanup when sharing ends
 - Optional expiry and download limits
-- Cloudflare Quick Tunnel by default, or Tailscale Funnel for sensitive builds
+- Automatic provider discovery: starts every installed provider (Tailscale
+  Serve, Tailscale Funnel, and Cloudflare Quick Tunnel) and warns about the
+  ones unavailable on this Mac
 
 Remote Installer distributes an existing build. It does **not** sign, re-sign,
 register devices, convert App Bundles or split APKs, or make Simulator and App
@@ -108,16 +113,72 @@ The command exits when either limit is reached, after allowing an active downloa
 | -------------------- | -------------------------------------- |
 | `--expire-after 30m` | Stop sharing after a duration          |
 | `--timeout 300`      | Stop sharing after a number of seconds |
-| `--max-downloads 3`  | Stop after a number of downloads       |
+| `--max-downloads 3`  | Stop after a number of successful downloads |
 | `--no-qr`            | Do not print the terminal QR code      |
+| `--provider auto` (default) | Detect and start every installed provider |
+| `--provider tailscale-serve` | Keep the link private to your tailnet |
+| `--provider tailscale-funnel` | Create a public Tailscale link |
+| `--https-port PORT`   | Tailscale Serve port; auto mode picks another supported Funnel port; `--funnel-port` is a compatibility alias |
 
 Use either `--expire-after` or `--timeout`, not both. Run `remote-installer share --help` for every option.
 
+With the default `--provider auto`, Remote Installer checks for the Tailscale
+and cloudflared CLIs, starts every provider it can use in parallel, and prints a
+warning for each unavailable or unready provider. Tailscale Serve and Funnel
+use different HTTPS ports automatically so both can run in the same share. If
+you select one provider explicitly, only that provider is started.
+
+Tailscale Serve requires the phone to be on the same tailnet (or otherwise
+allowed by its access policy). Tailscale Funnel creates a public link and does
+not require Tailscale on the phone. The older `--provider tailscale` spelling
+is kept as an alias for `tailscale-funnel`; use the explicit provider name in
+new commands.
+
+Tailscale's tailnet-wide **MagicDNS** setting is different from each device's
+**Use Tailscale DNS** (`--accept-dns`) preference. Startup checks both settings:
+Funnel requires MagicDNS, while disabling DNS on the sharing computer alone
+does not prevent a correctly configured phone from using Serve. Serve warns
+when this computer's Tailscale DNS is off; enable it on devices opening the
+link, or provide equivalent DNS that resolves the hostname to the serving
+node. Funnel recipients use public DNS and do not need Tailscale DNS.
+These checks do not change your DNS settings or verify the phone's settings.
+Use a Tailscale CLI that supports `tailscale dns status --json`. If DNS
+inspection fails, startup stops with an actionable error instead of assuming
+the settings are correct.
+
+For an opt-in real HTTPS smoke test, run the providers separately on a node
+with no existing Serve/Funnel configuration:
+
+```bash
+cargo build --locked
+python3 scripts/test-tailscale-live.py \
+  --provider tailscale-serve \
+  --tailscale-bin /Applications/Tailscale.app/Contents/MacOS/Tailscale
+python3 scripts/test-tailscale-live.py \
+  --provider tailscale-funnel \
+  --tailscale-bin /Applications/Tailscale.app/Contents/MacOS/Tailscale
+```
+
+The smoke test requires an authenticated Tailscale setup, temporarily creates
+the selected mode's configuration, and checks the HTTPS page, manifest, range
+response, full IPA bytes, and cleanup. Its synthetic IPA checks transport only;
+it is not a signing or device-install test.
+For Funnel, the test requires a public relay address so tailnet access cannot
+produce a false positive. If MagicDNS resolves the hostname privately, pass
+`--resolve-address PUBLIC_FUNNEL_IP` using its public DNS address. TLS
+certificate and hostname validation remain enabled.
+For Serve, check that the requesting device uses Tailscale DNS and resolves the
+hostname to the serving node's tailnet IP. To isolate a DNS problem during the
+smoke test, `--resolve-address TAILNET_IP` pins that address without changing
+system DNS settings. The first TLS connection may take longer while Tailscale
+obtains its HTTPS certificate.
+
 ## Important security notes
 
-- **The link is the credential.** Anyone who receives it can install the build, and it can be forwarded.
+- **Public links are credentials.** Anyone who receives a Cloudflare or Funnel link can install the build, and it can be forwarded. Serve also requires access to the tailnet.
 - Use `--expire-after` and `--max-downloads` when sharing with someone else.
 - The build remains on your Mac rather than being uploaded for storage.
+- Cloudflare Quick Tunnel and Tailscale Funnel links are public. Tailscale Serve keeps access within your tailnet.
 - With Cloudflare, TLS terminates at Cloudflare while the build is transferred.
 - Stopping the command closes the tunnel and deletes Remote Installer's temporary copy.
 
@@ -128,6 +189,8 @@ Use either `--expire-after` or `--timeout`, not both. Run `remote-installer shar
 | **“Unable to Install”**                   | The iPhone UDID is in the embedded profile, the profile is valid, and the app was rebuilt after registering the device. |
 | **Install button does nothing**           | Open the install page in Safari. Some third-party iOS browsers do not hand the install link to the system.              |
 | **`cloudflared CLI was not found`**       | Run `brew install cloudflared`, or pass `--cloudflared-bin /path/to/cloudflared`.                                       |
+| **`Tailscale CLI was not found`**         | Run `brew install --cask tailscale`, or pass `--tailscale-bin /path/to/tailscale`.                                      |
+| **Serve link does not open**              | Confirm the phone is connected to the tailnet, its access policy allows the host, and Tailscale DNS resolves the hostname to that host's tailnet IP. |
 | **`app is not an iphoneos device build`** | Use `Build/Products/Debug-iphoneos/`, not `Debug-iphonesimulator/`.                                                     |
 | **Provisioning profile expired**          | Refresh signing in Xcode and rebuild.                                                                                   |
 | **Warning: `apkanalyzer was not found`**  | Sharing continues without manifest metadata or split-APK validation. Install Android SDK Command-Line Tools for full checks. |

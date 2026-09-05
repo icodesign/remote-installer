@@ -37,6 +37,18 @@ pub enum SigningPolicy {
     Trusted,
 }
 
+/// The operation currently preparing a package. Presentation belongs to the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparationStage {
+    InspectingInput,
+    CheckingCodeSignature,
+    CheckingDeviceArchitecture,
+    CheckingProvisioningProfile,
+    CopyingApp,
+    PackagingIpa,
+    InspectingPackage,
+}
+
 /// A canonical installable package ready for the share service to stage.
 /// The temporary directory, when present, owns a package derived from an input
 /// such as a local iOS app bundle.
@@ -113,6 +125,27 @@ pub fn prepare_with_apk_toolchain(
     signing_policy: SigningPolicy,
     apk_toolchain: Option<&ApkToolchain>,
 ) -> Result<PreparedArtifact, ArtifactInputError> {
+    prepare_with_progress(
+        source,
+        requested_file_name,
+        staging_root,
+        signing_policy,
+        apk_toolchain,
+        |_| {},
+    )
+}
+
+/// Prepare a package, reporting each operation before it starts. The callback
+/// runs synchronously on the preparing thread; callers control how to display it.
+pub fn prepare_with_progress(
+    source: &Path,
+    requested_file_name: Option<&str>,
+    staging_root: &Path,
+    signing_policy: SigningPolicy,
+    apk_toolchain: Option<&ApkToolchain>,
+    mut progress: impl FnMut(PreparationStage),
+) -> Result<PreparedArtifact, ArtifactInputError> {
+    progress(PreparationStage::InspectingInput);
     let source_metadata = std::fs::symlink_metadata(source)?;
     if source_metadata.file_type().is_symlink() {
         return Err(ArtifactInputError::Invalid(
@@ -127,6 +160,7 @@ pub fn prepare_with_apk_toolchain(
         if extension.as_deref() == Some("apk") {
             let unavailable_toolchain = ApkToolchain::from_optional_paths(None, None);
             let toolchain = apk_toolchain.unwrap_or(&unavailable_toolchain);
+            progress(PreparationStage::InspectingPackage);
             let metadata = apk::inspect(source, requested_file_name, toolchain)?;
             return Ok(PreparedArtifact {
                 path: source.to_path_buf(),
@@ -160,7 +194,9 @@ pub fn prepare_with_apk_toolchain(
                 "source file must be an IPA or APK".into(),
             ));
         }
+        progress(PreparationStage::InspectingPackage);
         let (metadata, signing) = ipa::inspect_with_signing(source, requested_file_name)?;
+        progress(PreparationStage::CheckingProvisioningProfile);
         verify_ipa_signing(&metadata, &signing, signing_policy)?;
         return Ok(PreparedArtifact {
             path: source.to_path_buf(),
@@ -176,8 +212,11 @@ pub fn prepare_with_apk_toolchain(
     }
 
     let app = inspect_app_bundle(source)?;
+    progress(PreparationStage::CheckingCodeSignature);
     verify_code_signature(source)?;
+    progress(PreparationStage::CheckingDeviceArchitecture);
     verify_device_architecture(&app.executable)?;
+    progress(PreparationStage::CheckingProvisioningProfile);
     verify_provisioning_profile(&app.provisioning_profile, &app.bundle_identifier)?;
 
     std::fs::create_dir_all(staging_root)?;
@@ -189,10 +228,11 @@ pub fn prepare_with_apk_toolchain(
         .transpose()?
         .unwrap_or_else(|| format!("{}.ipa", app.name.trim_end_matches(".app")));
     let output = temporary.path().join(&file_name);
-    package_app_bundle(source, &app.name, temporary.path(), &output)?;
+    package_app_bundle(source, &app.name, temporary.path(), &output, &mut progress)?;
     // No `verify_ipa_signing` here: this IPA was just packaged from a bundle
     // whose signature, architecture, and profile were verified directly above,
     // with tools that need the bundle on disk.
+    progress(PreparationStage::InspectingPackage);
     let metadata = ipa::inspect(&output, Some(&file_name))?;
     Ok(PreparedArtifact {
         path: output,
@@ -534,7 +574,9 @@ fn package_app_bundle(
     app_name: &str,
     temporary_root: &Path,
     output: &Path,
+    progress: &mut impl FnMut(PreparationStage),
 ) -> Result<(), ArtifactInputError> {
+    progress(PreparationStage::CopyingApp);
     let payload = temporary_root.join("Payload");
     std::fs::create_dir(&payload)?;
     let copy = Command::new("/usr/bin/ditto")
@@ -543,8 +585,20 @@ fn package_app_bundle(
         .arg(payload.join(app_name))
         .output()?;
     require_command_success("ditto app copy", copy)?;
+    progress(PreparationStage::PackagingIpa);
+    // Temporary sharing favors startup latency over the smallest archive.
+    // Keep DEFLATE compression and ditto's bundle/permission handling, but
+    // avoid spending most of preparation on zlib's default compression level.
     let archive = Command::new("/usr/bin/ditto")
-        .args(["-c", "-k", "--norsrc", "--noextattr", "--keepParent"])
+        .args([
+            "-c",
+            "-k",
+            "--norsrc",
+            "--noextattr",
+            "--keepParent",
+            "--zlibCompressionLevel",
+            "1",
+        ])
         .arg(&payload)
         .arg(output)
         .output()?;
@@ -557,6 +611,7 @@ fn package_app_bundle(
     _app_name: &str,
     _temporary_root: &Path,
     _output: &Path,
+    _progress: &mut impl FnMut(PreparationStage),
 ) -> Result<(), ArtifactInputError> {
     Err(ArtifactInputError::Invalid(
         "local .app packaging requires macOS ditto".into(),
@@ -745,12 +800,73 @@ mod tests {
         let app = write_app(temporary.path(), "iphoneos", "iPhoneOS");
         let packaging = tempfile::tempdir().unwrap();
         let output = packaging.path().join("Example.ipa");
-        package_app_bundle(&app, "Example.app", packaging.path(), &output).unwrap();
+        // Include nested signed-bundle data and a compressible executable to
+        // check that faster packaging preserves bytes, modes, and compression.
+        let executable = vec![0x42; 128 * 1024];
+        std::fs::write(app.join("Example"), &executable).unwrap();
+        let resources = app.join("PlugIns/Widget.appex/_CodeSignature");
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::write(resources.join("CodeResources"), b"sealed resources").unwrap();
+        let mut stages = Vec::new();
+        package_app_bundle(
+            &app,
+            "Example.app",
+            packaging.path(),
+            &output,
+            &mut |stage| {
+                stages.push(stage);
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            stages,
+            [PreparationStage::CopyingApp, PreparationStage::PackagingIpa]
+        );
         let metadata = ipa::inspect(&output, None).unwrap();
         assert_eq!(metadata.bundle_identifier, "com.example.app");
         assert_eq!(metadata.bundle_version, "1");
         let icon = metadata.icon.expect("app icon");
         assert_eq!((icon.width, icon.height), (180, 180));
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&output).unwrap()).unwrap();
+        for (name, expected) in [
+            ("Payload/Example.app/Example", executable.as_slice()),
+            (
+                "Payload/Example.app/embedded.mobileprovision",
+                b"profile".as_slice(),
+            ),
+            (
+                "Payload/Example.app/PlugIns/Widget.appex/_CodeSignature/CodeResources",
+                b"sealed resources".as_slice(),
+            ),
+        ] {
+            let mut entry = archive.by_name(name).unwrap();
+            let mut actual = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut actual).unwrap();
+            assert_eq!(actual, expected);
+        }
+        let entry = archive.by_name("Payload/Example.app/Example").unwrap();
+        assert_eq!(entry.unix_mode().unwrap() & 0o777, 0o755);
+        assert_eq!(entry.compression(), zip::CompressionMethod::Deflated);
+        assert!(entry.compressed_size() < entry.size() / 10);
+    }
+
+    #[test]
+    fn invalid_input_stops_before_packaging() {
+        let temporary = tempfile::tempdir().unwrap();
+        let app = write_app(temporary.path(), "iphonesimulator", "iPhoneSimulator");
+        let staging = temporary.path().join("staging");
+        let mut stages = Vec::new();
+        let result = prepare_with_progress(
+            &app,
+            None,
+            &staging,
+            SigningPolicy::Required,
+            None,
+            |stage| stages.push(stage),
+        );
+        assert!(result.is_err());
+        assert_eq!(stages, [PreparationStage::InspectingInput]);
+        assert!(!staging.exists());
     }
 
     fn ipa_metadata(bundle_identifier: &str) -> IpaMetadata {

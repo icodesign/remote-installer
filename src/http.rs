@@ -9,7 +9,7 @@ use http_body_util::{BodyExt, Empty, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::header::{
     ACCEPT_RANGES, ALLOW, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
-    CONTENT_TYPE, HeaderValue, RANGE, USER_AGENT,
+    CONTENT_TYPE, HOST, HeaderValue, RANGE, USER_AGENT,
 };
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -24,7 +24,7 @@ use tokio_util::io::ReaderStream;
 
 use crate::install_page;
 use crate::model::format_bytes;
-use crate::service::{ServiceError, ShareService};
+use crate::service::{DownloadPermit, ServiceError, ShareService};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type ResponseBody = http_body_util::combinators::BoxBody<Bytes, BoxError>;
@@ -147,10 +147,13 @@ impl HttpState {
                 // `manifest` then checks platform before it checks availability,
                 // so an Android artifact never appears to have this route.
                 let artifact = self.service.viewable_artifact(&id)?;
+                let public_base_url = self
+                    .service
+                    .public_base_url_for_authority(request_authority(&request));
                 let mut response = text_response(
                     StatusCode::OK,
                     "application/xml; charset=utf-8",
-                    self.service.manifest(artifact).await?,
+                    self.service.manifest_at(artifact, public_base_url).await?,
                 );
                 no_store(&mut response);
                 Ok(response)
@@ -159,7 +162,7 @@ impl HttpState {
                 self.download(&id, &extension, is_head, request, peer).await
             }
             Route::Found(Resource::Icon(id)) => self.icon_download(&id).await,
-            Route::Found(Resource::InstallPage(id)) => self.install_page(&id).await,
+            Route::Found(Resource::InstallPage(id)) => self.install_page(&id, &request).await,
             Route::MethodNotAllowed => Ok(method_not_allowed_response()),
             Route::NotFound => Ok(json_response(
                 StatusCode::NOT_FOUND,
@@ -183,8 +186,8 @@ impl HttpState {
         if is_head {
             // A HEAD must report the same headers a GET would without
             // spending one of the user's --max-downloads attempts, so it
-            // validates through `servable_artifact` rather than
-            // `authorize_download`, which atomically claims a slot.
+            // validates through `servable_artifact` rather than reserving a
+            // body-owned download permit.
             // `Range` is not honoured on HEAD; the full entity length is
             // always what gets reported.
             let artifact = self.service.servable_artifact(artifact_id)?;
@@ -199,11 +202,12 @@ impl HttpState {
                 None,
                 false,
                 None,
+                None,
             )
             .await;
         }
         let grant_token = query_param(request.uri().query(), "download");
-        let artifact = self
+        let permit = self
             .service
             .authorize_download(artifact_id, grant_token.as_deref())
             .await?;
@@ -213,26 +217,27 @@ impl HttpState {
             .get(RANGE)
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned);
-        let identity = DownloadIdentity::from_request(&request, peer, &artifact.id);
+        let identity = DownloadIdentity::from_request(&request, peer, &described_artifact.id);
         tracing::info!(
             request_id = %identity.request_id,
             client_id = %identity.client_id,
             client_ip = %identity.client_ip,
             client_ip_source = identity.client_ip_source,
             user_agent = %identity.user_agent,
-            artifact_id = %artifact.id,
-            file_name = %artifact.file_name,
+            artifact_id = %described_artifact.id,
+            file_name = %described_artifact.file_name,
             range = ?range,
-            platform = ?artifact.platform(),
+            platform = ?described_artifact.platform(),
             "package download started"
         );
         file_response(
             path,
-            &artifact.file_name,
-            artifact.download_content_type(),
+            &described_artifact.file_name,
+            described_artifact.download_content_type(),
             range.as_deref(),
             true,
             Some(identity),
+            Some(permit),
         )
         .await
     }
@@ -243,15 +248,24 @@ impl HttpState {
         image_response(path).await
     }
 
-    async fn install_page(&self, artifact_id: &str) -> Result<Response<ResponseBody>, HttpError> {
+    async fn install_page(
+        &self,
+        artifact_id: &str,
+        request: &Request<Incoming>,
+    ) -> Result<Response<ResponseBody>, HttpError> {
         let artifact = self.service.viewable_artifact(artifact_id)?;
+        let public_base_url = self
+            .service
+            .public_base_url_for_authority(request_authority(request));
         let install_action_url = match self.service.availability() {
             crate::model::Availability::Installable => {
-                self.service.install_action_url(artifact).await?
+                self.service
+                    .install_action_url_at(artifact, public_base_url)
+                    .await?
             }
             _ => String::new(),
         };
-        let icon_url = self.service.icon_url(artifact);
+        let icon_url = self.service.icon_url_at(artifact, public_base_url);
         let html = install_page::render(
             artifact,
             &install_action_url,
@@ -275,6 +289,17 @@ impl HttpState {
         no_store(&mut response);
         Ok(response)
     }
+}
+
+fn request_authority<B>(request: &Request<B>) -> Option<&str> {
+    request
+        .headers()
+        .get("x-forwarded-host")
+        .or_else(|| request.headers().get(HOST))
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 /// Run the loopback origin used by one share session until the caller's
@@ -664,9 +689,14 @@ struct DownloadProgress {
     last_report: Instant,
     /// Set once the completion line is emitted, so `Drop` stays quiet.
     finished: bool,
+    /// The quota reservation lives with the response body, not with request
+    /// authorization. It is committed when `record` sees the final bytes and
+    /// released automatically if the body is dropped early.
+    permit: Option<DownloadPermit>,
 }
 
 impl DownloadProgress {
+    #[cfg(test)]
     fn new(
         file_name: &str,
         expected: u64,
@@ -674,6 +704,21 @@ impl DownloadProgress {
         now: Instant,
         identity: DownloadIdentity,
     ) -> Self {
+        Self::with_permit(file_name, expected, is_range, now, identity, None)
+    }
+
+    fn with_permit(
+        file_name: &str,
+        expected: u64,
+        is_range: bool,
+        now: Instant,
+        identity: DownloadIdentity,
+        mut permit: Option<DownloadPermit>,
+    ) -> Self {
+        let finished = expected == 0;
+        if finished && let Some(permit) = permit.as_mut() {
+            permit.complete_response();
+        }
         Self {
             file_name: file_name.to_string(),
             identity,
@@ -682,7 +727,8 @@ impl DownloadProgress {
             started: now,
             sent: 0,
             last_report: now,
-            finished: false,
+            finished,
+            permit,
         }
     }
 
@@ -691,6 +737,9 @@ impl DownloadProgress {
         self.sent = self.sent.saturating_add(count);
         if self.expected > 0 && self.sent >= self.expected && !self.finished {
             self.finished = true;
+            if let Some(permit) = self.permit.as_mut() {
+                permit.complete_response();
+            }
             let scope = if self.is_range { " range" } else { "" };
             return Some(format!(
                 "Download complete: {} [{}] ({}{scope} in {})",
@@ -764,6 +813,7 @@ async fn file_response(
     range_header: Option<&str>,
     report_progress: bool,
     identity: Option<DownloadIdentity>,
+    mut permit: Option<DownloadPermit>,
 ) -> Result<Response<ResponseBody>, HttpError> {
     let mut file = tokio::fs::File::open(&path).await?;
     let total = file.metadata().await?.len();
@@ -776,18 +826,22 @@ async fn file_response(
         file.seek(std::io::SeekFrom::Start(range.start)).await?;
     }
     let length = range.map_or(total, |range| range.length());
+    if let Some(permit) = permit.as_mut() {
+        permit.configure_response(range.map(|range| (range.start, range.end_inclusive)), total);
+    }
     let reader = tokio::io::AsyncReadExt::take(file, length);
 
     let reader_stream = ReaderStream::new(reader);
     // A HEAD has its body discarded by `empty_body`, so instrumenting it would
     // report a download that never happened.
     let body = if report_progress {
-        let mut progress = DownloadProgress::new(
+        let mut progress = DownloadProgress::with_permit(
             file_name,
             length,
             range.is_some(),
             Instant::now(),
             identity.expect("download progress requires request identity"),
+            permit,
         );
         StreamBody::new(futures_util::StreamExt::map(
             reader_stream,
@@ -837,7 +891,9 @@ async fn file_response(
             .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
     );
     // Quota enforcement happens in this process. Do not let a tunnel or
-    // intermediary replay a cached package without reaching `authorize_download`.
+    // intermediary replay a cached package without reaching
+    // `authorize_download`; the body-owned permit commits only after the
+    // response stream reaches EOF.
     response
         .headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -946,6 +1002,7 @@ fn error_response(error: HttpError) -> Response<ResponseBody> {
         HttpError::Service(ServiceError::NotFound(_)) => StatusCode::NOT_FOUND,
         HttpError::Service(ServiceError::Gone(_)) => StatusCode::GONE,
         HttpError::Service(ServiceError::Forbidden(_)) => StatusCode::FORBIDDEN,
+        HttpError::Service(ServiceError::DownloadInProgress) => StatusCode::TOO_MANY_REQUESTS,
         HttpError::RangeNotSatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -958,6 +1015,7 @@ fn error_response(error: HttpError) -> Response<ResponseBody> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service::DownloadQuota;
 
     #[tokio::test]
     async fn image_response_serves_png_with_security_headers() {
@@ -985,6 +1043,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -999,6 +1058,7 @@ mod tests {
             "application/octet-stream",
             Some("bytes=2-5"),
             false,
+            None,
             None,
         )
         .await
@@ -1016,6 +1076,7 @@ mod tests {
             Some("bytes=-3"),
             false,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1028,6 +1089,7 @@ mod tests {
             "application/octet-stream",
             Some("bytes=99-"),
             false,
+            None,
             None,
         )
         .await;
@@ -1111,6 +1173,7 @@ mod tests {
             "application/octet-stream",
             None,
             false,
+            None,
             None,
         )
         .await
@@ -1254,6 +1317,27 @@ mod tests {
     }
 
     #[test]
+    fn dropping_an_unfinished_response_releases_its_download_permit() {
+        let quota = Arc::new(DownloadQuota::new(Some(1)));
+        quota.reserve().unwrap();
+        let progress = DownloadProgress::with_permit(
+            "App.ipa",
+            1000,
+            false,
+            Instant::now(),
+            DownloadIdentity::test(),
+            Some(DownloadPermit::direct(Arc::clone(&quota))),
+        );
+
+        drop(progress);
+        assert_eq!(quota.completed(), 0);
+        // The failed response released capacity, so the next attempt can be
+        // reserved instead of being treated as a spent max-downloads slot.
+        quota.reserve().unwrap();
+        quota.release();
+    }
+
+    #[test]
     fn progress_lines_are_rate_limited() {
         let start = Instant::now();
         let mut progress =
@@ -1308,6 +1392,7 @@ mod tests {
             None,
             true,
             Some(DownloadIdentity::test()),
+            None,
         )
         .await
         .unwrap();

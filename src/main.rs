@@ -5,9 +5,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use remote_installer::apk::ApkToolchain;
-use remote_installer::artifact_input::{self, SigningPolicy};
-use remote_installer::exposure::{ExposureProvider, ExposureSession};
+use remote_installer::artifact_input::{self, PreparationStage, SigningPolicy};
+use remote_installer::exposure::{ExposureProvider, ExposureSession, provider_binary_available};
 use remote_installer::http::{self, HttpState};
 use remote_installer::model::{Artifact, Availability, PlatformMetadata};
 use remote_installer::service::{ShareConfig, ShareService};
@@ -15,6 +16,7 @@ use tracing_subscriber::EnvFilter;
 use url::Url;
 
 const TUNNEL_STARTUP_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+const BUILD_PREPARATION_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -45,8 +47,11 @@ Examples:
   # Let exactly one person install, then stop
   remote-installer share MyApp.ipa --max-downloads 1
 
-  # Keep the build off Cloudflare's servers (needs a Tailscale account)
-  remote-installer share MyApp.ipa --provider tailscale
+  # Keep the install page private to your tailnet
+  remote-installer share MyApp.ipa --provider tailscale-serve
+
+  # Share a public link through Tailscale Funnel
+  remote-installer share MyApp.ipa --provider tailscale-funnel
 
   # Share a signed standalone Android APK
   remote-installer share MyApp.apk
@@ -70,8 +75,9 @@ struct ShareArgs {
     /// Stop sharing after this many OTA download attempts.
     #[arg(long, value_name = "COUNT")]
     max_downloads: Option<u64>,
-    /// Temporary tunnel provider.
-    #[arg(long, value_enum, default_value_t = ShareProvider::Cloudflare)]
+    /// Tunnel provider (`tailscale` is an alias for `tailscale-funnel`).
+    /// Omit this option to detect and start every installed provider.
+    #[arg(long, value_enum, default_value_t = ShareProvider::Auto)]
     provider: ShareProvider,
     /// Do not print the install link as a terminal QR code.
     #[arg(long)]
@@ -80,9 +86,17 @@ struct ShareArgs {
     /// not control APK checks.
     #[arg(long)]
     allow_unsigned: bool,
-    /// Public HTTPS port used by Tailscale Funnel (Tailscale only).
-    #[arg(long, value_name = "PORT", default_value_t = 443, value_parser = parse_funnel_port)]
-    funnel_port: u16,
+    /// HTTPS port used by Tailscale Serve or an explicitly selected Funnel.
+    /// Auto mode picks another supported Funnel port; `--funnel-port` remains
+    /// a visible compatibility alias.
+    #[arg(
+        long = "https-port",
+        visible_alias = "funnel-port",
+        value_name = "PORT",
+        default_value_t = 443,
+        value_parser = parse_https_port
+    )]
+    https_port: u16,
     /// Explicit path to the Tailscale CLI.
     #[arg(long, value_name = "PATH")]
     tailscale_bin: Option<PathBuf>,
@@ -114,14 +128,23 @@ impl ShareArgs {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ShareProvider {
-    Tailscale,
+    #[value(name = "auto")]
+    Auto,
+    #[value(name = "tailscale-serve")]
+    TailscaleServe,
+    #[value(name = "tailscale-funnel", alias = "tailscale")]
+    TailscaleFunnel,
     Cloudflare,
 }
 
 impl From<ShareProvider> for ExposureProvider {
     fn from(value: ShareProvider) -> Self {
         match value {
-            ShareProvider::Tailscale => Self::Tailscale,
+            ShareProvider::Auto => {
+                panic!("auto provider must be resolved before conversion")
+            }
+            ShareProvider::TailscaleServe => Self::TailscaleServe,
+            ShareProvider::TailscaleFunnel => Self::TailscaleFunnel,
             ShareProvider::Cloudflare => Self::Cloudflare,
         }
     }
@@ -166,16 +189,25 @@ async fn share(args: ShareArgs) -> Result<(), Box<dyn std::error::Error + Send +
         return Err("--listen must be a loopback address when using share".into());
     }
     match args.provider {
-        ShareProvider::Tailscale if args.cloudflared_bin.is_some() => {
-            return Err("--cloudflared-bin requires --provider cloudflare".into());
+        ShareProvider::Auto => {}
+        ShareProvider::TailscaleServe | ShareProvider::TailscaleFunnel => {
+            if args.cloudflared_bin.is_some() {
+                return Err("--cloudflared-bin requires --provider cloudflare".into());
+            }
         }
-        ShareProvider::Cloudflare if args.tailscale_bin.is_some() => {
-            return Err("--tailscale-bin requires --provider tailscale".into());
+        ShareProvider::Cloudflare => {
+            if args.tailscale_bin.is_some() {
+                return Err(
+                    "--tailscale-bin requires --provider tailscale-serve or tailscale-funnel"
+                        .into(),
+                );
+            }
         }
-        _ => {}
+    }
+    if matches!(args.provider, ShareProvider::TailscaleFunnel) {
+        validate_funnel_port(args.https_port)?;
     }
 
-    let provider: ExposureProvider = args.provider.into();
     let is_apk = args
         .artifact
         .extension()
@@ -192,7 +224,7 @@ async fn share(args: ShareArgs) -> Result<(), Box<dyn std::error::Error + Send +
             )
         })
         .transpose()?;
-    eprintln!("Validating build: {}...", args.artifact.display());
+    eprintln!("Preparing build: {}...", args.artifact.display());
     let temporary = tempfile::tempdir()?;
     let source = args.artifact.clone();
     let input_staging = temporary.path().join("input");
@@ -203,16 +235,48 @@ async fn share(args: ShareArgs) -> Result<(), Box<dyn std::error::Error + Send +
     };
     // Validation runs before the tunnel opens, so a build that cannot install
     // fails without ever having been exposed publicly.
-    let prepared = tokio::task::spawn_blocking(move || {
-        artifact_input::prepare_with_apk_toolchain(
+    let preparation_started_at = std::time::Instant::now();
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut preparation = tokio::task::spawn_blocking(move || {
+        artifact_input::prepare_with_progress(
             &source,
             None,
             &input_staging,
             signing_policy,
             apk_toolchain.as_ref(),
+            |stage| {
+                let _ = progress_tx.send(stage);
+            },
         )
-    })
-    .await??;
+    });
+    let mut current_stage = PreparationStage::InspectingInput;
+    let mut stage_started_at = preparation_started_at;
+    let mut preparation_progress = tokio::time::interval_at(
+        tokio::time::Instant::now() + BUILD_PREPARATION_PROGRESS_INTERVAL,
+        BUILD_PREPARATION_PROGRESS_INTERVAL,
+    );
+    let prepared = loop {
+        tokio::select! {
+            // Drain stage changes before completion so short operations are
+            // also reported, even when the blocking task has already finished.
+            biased;
+            Some(stage) = progress_rx.recv() => {
+                current_stage = stage;
+                stage_started_at = std::time::Instant::now();
+                eprintln!("  {}...", preparation_stage_label(stage));
+            }
+            result = &mut preparation => break result??,
+            _ = preparation_progress.tick() => eprintln!(
+                "  Still working: {} ({} elapsed)...",
+                preparation_stage_label(current_stage),
+                format_duration(stage_started_at.elapsed()),
+            ),
+        }
+    };
+    eprintln!(
+        "Build prepared in {:.1}s.",
+        preparation_started_at.elapsed().as_secs_f64(),
+    );
     let validation_was_degraded = !prepared.warnings().is_empty();
     for warning in prepared.warnings() {
         eprintln!("Warning: {warning}");
@@ -225,37 +289,21 @@ async fn share(args: ShareArgs) -> Result<(), Box<dyn std::error::Error + Send +
     } else {
         "Build validated"
     };
-    eprintln!(
-        "{validation_summary}. Starting {} (this may take a few seconds)...",
-        provider.name()
-    );
-    let exposure_start = ExposureSession::start(
-        provider,
-        &origin_url,
-        args.tailscale_bin.as_deref(),
-        args.cloudflared_bin.as_deref(),
-        args.funnel_port,
-    );
-    tokio::pin!(exposure_start);
-    let startup_started_at = std::time::Instant::now();
-    let mut startup_progress = tokio::time::interval_at(
-        tokio::time::Instant::now() + TUNNEL_STARTUP_PROGRESS_INTERVAL,
-        TUNNEL_STARTUP_PROGRESS_INTERVAL,
-    );
-    let mut exposure = loop {
-        tokio::select! {
-            result = &mut exposure_start => break result?,
-            _ = startup_progress.tick() => eprintln!(
-                "Still waiting for {}... ({} elapsed)",
-                provider.name(),
-                format_duration(startup_started_at.elapsed()),
-            ),
+    eprintln!("{validation_summary}. Starting supported tunnel providers...");
+    let mut exposures = start_exposures(&args, &origin_url).await?;
+    for exposure in &exposures {
+        for warning in exposure.warnings() {
+            eprintln!("Warning: {}: {warning}", exposure.provider().name());
         }
-    };
-    eprintln!("Tunnel ready. Preparing install page...");
-    let setup_result = ShareService::create(
+    }
+    eprintln!("Tunnel startup complete. Preparing install page...");
+    let public_base_urls = exposures
+        .iter()
+        .map(|exposure| exposure.public_base_url().clone())
+        .collect();
+    let setup_result = ShareService::create_with_public_base_urls(
         temporary.path().join("artifacts"),
-        exposure.public_base_url().clone(),
+        public_base_urls,
         &prepared,
         ShareConfig {
             artifact_ttl: args.artifact_ttl(),
@@ -266,44 +314,302 @@ async fn share(args: ShareArgs) -> Result<(), Box<dyn std::error::Error + Send +
     let service = match setup_result {
         Ok(service) => Arc::new(service),
         Err(error) => {
-            if let Err(cleanup_error) = exposure.stop().await {
-                tracing::error!(%cleanup_error, "failed to close tunnel after setup error");
-            }
+            stop_exposures(&mut exposures).await;
             return Err(error.into());
         }
     };
     let artifact = service.artifact().clone();
-    let install_page_url = service.install_page_url(&artifact);
-    let install_action_url = service.install_action_url(&artifact).await?;
-    print_share_banner(
-        &artifact,
-        &exposure,
-        &install_page_url,
-        &install_action_url,
-        &args,
-    );
+    let links = match provider_links(&service, &artifact, &exposures).await {
+        Ok(links) => links,
+        Err(error) => {
+            stop_exposures(&mut exposures).await;
+            return Err(error);
+        }
+    };
+    print_share_banners(&artifact, &links, &args);
 
     let state = HttpState {
         service: Arc::clone(&service),
     };
     let origin_result = tokio::select! {
         result = http::run_listener(listener, state, wait_for_shutdown(Arc::clone(&service))) => result,
-        result = exposure.wait_for_exit() => {
-            result.map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })
-        }
+        result = wait_for_any_exposure_exit(&mut exposures) => result,
     };
-    let cleanup_result = exposure.stop().await;
-    if let Err(error) = cleanup_result {
-        tracing::error!(%error, "failed to close the tunnel");
+    let cleanup_errors = stop_exposures(&mut exposures).await;
+    for error in cleanup_errors {
+        tracing::error!(%error, "failed to close a tunnel");
         if origin_result.is_ok() {
-            return Err(error.into());
+            return Err(error);
         }
     }
     origin_result
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ProviderPlan {
+    provider: ExposureProvider,
+    https_port: u16,
+}
+
+#[derive(Debug)]
+struct ProviderLink {
+    provider: ExposureProvider,
+    install_page_url: String,
+    install_action_url: String,
+}
+
+fn provider_plans(args: &ShareArgs) -> Vec<ProviderPlan> {
+    match args.provider {
+        ShareProvider::Auto => vec![
+            ProviderPlan {
+                provider: ExposureProvider::TailscaleServe,
+                https_port: args.https_port,
+            },
+            ProviderPlan {
+                provider: ExposureProvider::TailscaleFunnel,
+                // Serve and Funnel cannot share a Tailscale HTTPS port. Keep
+                // both available in auto mode by selecting another supported
+                // Funnel port; explicit provider selection retains the exact
+                // --https-port value the caller requested.
+                https_port: auto_funnel_port(args.https_port),
+            },
+            ProviderPlan {
+                provider: ExposureProvider::Cloudflare,
+                https_port: args.https_port,
+            },
+        ],
+        ShareProvider::TailscaleServe => vec![ProviderPlan {
+            provider: ExposureProvider::TailscaleServe,
+            https_port: args.https_port,
+        }],
+        ShareProvider::TailscaleFunnel => vec![ProviderPlan {
+            provider: ExposureProvider::TailscaleFunnel,
+            https_port: args.https_port,
+        }],
+        ShareProvider::Cloudflare => vec![ProviderPlan {
+            provider: ExposureProvider::Cloudflare,
+            https_port: args.https_port,
+        }],
+    }
+}
+
+fn auto_funnel_port(serve_port: u16) -> u16 {
+    [443, 8443, 10000]
+        .into_iter()
+        .find(|port| *port != serve_port)
+        .unwrap_or(8443)
+}
+
+async fn start_exposures(
+    args: &ShareArgs,
+    target: &Url,
+) -> Result<Vec<ExposureSession>, Box<dyn std::error::Error + Send + Sync>> {
+    let auto = matches!(args.provider, ShareProvider::Auto);
+    let mut plans = provider_plans(args);
+    let tailscale_available = provider_binary_available(
+        ExposureProvider::TailscaleServe,
+        args.tailscale_bin.as_deref(),
+        args.cloudflared_bin.as_deref(),
+    );
+    let cloudflare_available = provider_binary_available(
+        ExposureProvider::Cloudflare,
+        args.tailscale_bin.as_deref(),
+        args.cloudflared_bin.as_deref(),
+    );
+    let tailscale_ready = if auto && tailscale_available {
+        match ExposureSession::check_tailscale_for_auto(args.tailscale_bin.as_deref()).await {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!(
+                    "Warning: Tailscale is unavailable; skipping Tailscale providers: {error}"
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    if auto {
+        plans.retain(|plan| {
+            let available = match plan.provider {
+                ExposureProvider::TailscaleServe
+                | ExposureProvider::TailscaleFunnel
+                | ExposureProvider::Tailscale => tailscale_available && tailscale_ready,
+                ExposureProvider::Cloudflare => cloudflare_available,
+            };
+            if !available {
+                eprintln!(
+                    "Warning: {} is unavailable or not ready; skipping provider.",
+                    plan.provider.name()
+                );
+            }
+            available
+        });
+    }
+    if plans.is_empty() {
+        return Err("no supported tunnel provider is available".into());
+    }
+
+    let mut pending = plans
+        .iter()
+        .map(|plan| plan.provider.name())
+        .collect::<Vec<_>>();
+    let mut starts = FuturesUnordered::new();
+    for plan in plans {
+        let provider = plan.provider;
+        let tailscale_binary = args.tailscale_bin.as_deref();
+        let cloudflared_binary = args.cloudflared_bin.as_deref();
+        let use_shared_tailscale_preflight = auto
+            && tailscale_ready
+            && matches!(
+                provider,
+                ExposureProvider::TailscaleServe
+                    | ExposureProvider::TailscaleFunnel
+                    | ExposureProvider::Tailscale
+            );
+        starts.push(async move {
+            let result = if use_shared_tailscale_preflight {
+                ExposureSession::start_without_configuration_check(
+                    provider,
+                    target,
+                    tailscale_binary,
+                    cloudflared_binary,
+                    plan.https_port,
+                )
+                .await
+            } else {
+                ExposureSession::start(
+                    provider,
+                    target,
+                    tailscale_binary,
+                    cloudflared_binary,
+                    plan.https_port,
+                )
+                .await
+            };
+            (plan, result)
+        });
+    }
+
+    let startup_started_at = std::time::Instant::now();
+    let mut startup_progress = tokio::time::interval_at(
+        tokio::time::Instant::now() + TUNNEL_STARTUP_PROGRESS_INTERVAL,
+        TUNNEL_STARTUP_PROGRESS_INTERVAL,
+    );
+    let mut results = Vec::new();
+    while !starts.is_empty() {
+        tokio::select! {
+            biased;
+            Some((plan, result)) = starts.next() => {
+                pending.retain(|name| *name != plan.provider.name());
+                results.push((plan, result));
+            }
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("\nInterrupted while starting tunnel providers.");
+                return Err("sharing interrupted during tunnel startup".into());
+            }
+            _ = startup_progress.tick() => eprintln!(
+                "Still waiting for {}... ({})",
+                pending.join(", "),
+                format_duration(startup_started_at.elapsed()),
+            ),
+        }
+    }
+
+    let mut exposures = Vec::new();
+    for (plan, result) in results {
+        match result {
+            Ok(exposure) => exposures.push(exposure),
+            Err(error) if auto => eprintln!(
+                "Warning: {} could not start; skipping provider: {error}",
+                plan.provider.name()
+            ),
+            Err(error) => {
+                return Err(format!("{} could not start: {error}", plan.provider.name()).into());
+            }
+        }
+    }
+    if exposures.is_empty() {
+        return Err("all supported tunnel providers failed to start".into());
+    }
+    exposures.sort_by_key(|exposure| provider_order(exposure.provider()));
+    Ok(exposures)
+}
+
+fn provider_order(provider: ExposureProvider) -> u8 {
+    match provider {
+        ExposureProvider::TailscaleServe => 0,
+        ExposureProvider::TailscaleFunnel | ExposureProvider::Tailscale => 1,
+        ExposureProvider::Cloudflare => 2,
+    }
+}
+
+async fn provider_links(
+    service: &ShareService,
+    artifact: &Artifact,
+    exposures: &[ExposureSession],
+) -> Result<Vec<ProviderLink>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut links = Vec::with_capacity(exposures.len());
+    for exposure in exposures {
+        let public_base_url = exposure.public_base_url();
+        links.push(ProviderLink {
+            provider: exposure.provider(),
+            install_page_url: service.install_page_url_at(artifact, public_base_url),
+            install_action_url: service
+                .install_action_url_at(artifact, public_base_url)
+                .await?,
+        });
+    }
+    Ok(links)
+}
+
+async fn wait_for_any_exposure_exit(
+    exposures: &mut [ExposureSession],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let names = exposures
+        .iter()
+        .map(|exposure| exposure.provider().name())
+        .collect::<Vec<_>>();
+    let mut waits = FuturesUnordered::new();
+    for (index, exposure) in exposures.iter_mut().enumerate() {
+        waits.push(async move { (index, exposure.wait_for_exit().await) });
+    }
+    let result = waits.next().await;
+    drop(waits);
+    match result {
+        Some((_index, Ok(()))) => Ok(()),
+        Some((index, Err(error))) => Err(format!("{} exited: {error}", names[index]).into()),
+        None => Ok(()),
+    }
+}
+
+async fn stop_exposures(
+    exposures: &mut [ExposureSession],
+) -> Vec<Box<dyn std::error::Error + Send + Sync>> {
+    let mut errors = Vec::new();
+    for exposure in exposures {
+        if let Err(error) = exposure.stop().await {
+            errors.push(Box::new(error) as Box<dyn std::error::Error + Send + Sync>);
+        }
+    }
+    errors
+}
+
+fn preparation_stage_label(stage: PreparationStage) -> &'static str {
+    match stage {
+        PreparationStage::InspectingInput => "Checking build input",
+        PreparationStage::CheckingCodeSignature => "Verifying code signature",
+        PreparationStage::CheckingDeviceArchitecture => "Checking device architecture",
+        PreparationStage::CheckingProvisioningProfile => "Checking iOS signing and provisioning",
+        PreparationStage::CopyingApp => "Copying app bundle",
+        PreparationStage::PackagingIpa => "Packaging app as IPA",
+        PreparationStage::InspectingPackage => "Inspecting package and calculating SHA-256",
+    }
+}
+
 /// Resolve when the share should stop serving: Ctrl-C, the configured expiry,
-/// or the last allowed download being claimed.
+/// or the last allowed download completing successfully.
 ///
 /// Returning here starts a graceful drain that can take up to two minutes, so
 /// a further Ctrl-C exits immediately instead. Without that escape the only
@@ -329,13 +635,7 @@ async fn wait_for_shutdown(service: Arc<ShareService>) {
     });
 }
 
-fn print_share_banner(
-    artifact: &Artifact,
-    exposure: &ExposureSession,
-    install_page_url: &str,
-    install_action_url: &str,
-    args: &ShareArgs,
-) {
+fn print_share_banners(artifact: &Artifact, links: &[ProviderLink], args: &ShareArgs) {
     println!("App: {}", artifact.title());
     match &artifact.platform_metadata {
         PlatformMetadata::Ios(metadata) => {
@@ -349,22 +649,42 @@ fn print_share_banner(
             }
         }
     }
-    println!("Tunnel: {}", exposure.provider().name());
-    println!("Install page: {install_page_url}");
-    println!("Install link: {install_action_url}");
     if let Some(expiry) = args.artifact_ttl() {
         println!("Expires in: {}", format_duration(expiry));
     }
     if let Some(maximum) = args.max_downloads {
         println!("Download limit: {maximum}");
     }
-    if !args.no_qr {
-        match qr_code(install_page_url) {
-            Some(code) => println!("\nScan with the phone camera:\n\n{code}"),
-            None => tracing::debug!("install URL could not be encoded as a QR code"),
+    for link in links {
+        println!("\nTunnel: {}", link.provider.name());
+        println!("Access: {}", access_scope(link.provider));
+        println!("Install page: {}", link.install_page_url);
+        println!("Install link: {}", link.install_action_url);
+        if !args.no_qr {
+            match qr_code(&link.install_page_url) {
+                Some(code) => println!(
+                    "\nScan with the phone camera ({}):\n\n{code}",
+                    link.provider.name()
+                ),
+                None => tracing::debug!(
+                    provider = link.provider.name(),
+                    "install URL could not be encoded as a QR code"
+                ),
+            }
         }
     }
     println!("Press Ctrl-C to stop sharing and close the tunnel.");
+}
+
+fn access_scope(provider: ExposureProvider) -> &'static str {
+    match provider {
+        ExposureProvider::TailscaleServe => {
+            "Tailnet only (phone needs Tailscale and working tailnet DNS)"
+        }
+        ExposureProvider::TailscaleFunnel
+        | ExposureProvider::Tailscale
+        | ExposureProvider::Cloudflare => "Public internet",
+    }
 }
 
 /// Render the install URL as a terminal QR code, so the phone can reach it
@@ -383,12 +703,20 @@ fn qr_code(url: &str) -> Option<String> {
     )
 }
 
-fn parse_funnel_port(value: &str) -> Result<u16, String> {
+fn parse_https_port(value: &str) -> Result<u16, String> {
     let port = value
         .parse::<u16>()
         .map_err(|error| format!("invalid HTTPS port: {error}"))?;
-    if matches!(port, 443 | 8443 | 10000) {
+    if port == 0 {
+        Err("HTTPS port must be between 1 and 65535".into())
+    } else {
         Ok(port)
+    }
+}
+
+fn validate_funnel_port(port: u16) -> Result<(), String> {
+    if matches!(port, 443 | 8443 | 10000) {
+        Ok(())
     } else {
         Err("Tailscale Funnel supports public ports 443, 8443, and 10000".into())
     }
@@ -468,10 +796,77 @@ mod tests {
     }
 
     #[test]
-    fn share_defaults_to_cloudflare_quick_tunnel() {
+    fn share_defaults_to_auto_provider_discovery() {
         let cli = Cli::try_parse_from(["remote-installer", "share", "Example.ipa"]).unwrap();
         let Command::Share(args) = cli.command;
-        assert!(matches!(args.provider, ShareProvider::Cloudflare));
+        assert!(matches!(args.provider, ShareProvider::Auto));
+        let plans = provider_plans(&args);
+        assert_eq!(
+            plans.iter().map(|plan| plan.provider).collect::<Vec<_>>(),
+            vec![
+                ExposureProvider::TailscaleServe,
+                ExposureProvider::TailscaleFunnel,
+                ExposureProvider::Cloudflare,
+            ]
+        );
+        assert_eq!(plans[0].https_port, 443);
+        assert_eq!(plans[1].https_port, 8443);
+    }
+
+    #[test]
+    fn auto_funnel_port_avoids_the_serve_port() {
+        assert_eq!(auto_funnel_port(443), 8443);
+        assert_eq!(auto_funnel_port(8443), 443);
+        assert_eq!(auto_funnel_port(10000), 443);
+    }
+
+    #[test]
+    fn tailscale_provider_values_map_to_their_exposure_modes() {
+        let cases = [
+            ("tailscale-serve", ExposureProvider::TailscaleServe),
+            ("tailscale-funnel", ExposureProvider::TailscaleFunnel),
+            ("tailscale", ExposureProvider::TailscaleFunnel),
+        ];
+        for (value, expected) in cases {
+            let cli = Cli::try_parse_from([
+                "remote-installer",
+                "share",
+                "Example.ipa",
+                "--provider",
+                value,
+            ])
+            .unwrap();
+            let Command::Share(args) = cli.command;
+            assert_eq!(ExposureProvider::from(args.provider), expected);
+        }
+    }
+
+    #[test]
+    fn access_scope_explains_private_and_public_providers() {
+        assert_eq!(
+            access_scope(ExposureProvider::TailscaleServe),
+            "Tailnet only (phone needs Tailscale and working tailnet DNS)"
+        );
+        assert_eq!(
+            access_scope(ExposureProvider::TailscaleFunnel),
+            "Public internet"
+        );
+        assert_eq!(
+            access_scope(ExposureProvider::Cloudflare),
+            "Public internet"
+        );
+    }
+
+    #[test]
+    fn https_port_and_funnel_port_alias_share_one_argument() {
+        assert_eq!(
+            share_args(&["--provider", "tailscale-serve", "--https-port", "8080"]).https_port,
+            8080
+        );
+        assert_eq!(
+            share_args(&["--provider", "tailscale-funnel", "--funnel-port", "8443"]).https_port,
+            8443
+        );
     }
 
     #[test]
@@ -501,10 +896,17 @@ mod tests {
 
     #[test]
     fn funnel_ports_are_restricted_to_the_supported_set() {
-        assert_eq!(parse_funnel_port("443").unwrap(), 443);
-        assert_eq!(parse_funnel_port("8443").unwrap(), 8443);
-        assert_eq!(parse_funnel_port("10000").unwrap(), 10000);
-        assert!(parse_funnel_port("8080").is_err());
+        for port in [443, 8443, 10000] {
+            assert!(validate_funnel_port(port).is_ok());
+        }
+        assert!(validate_funnel_port(8080).is_err());
+    }
+
+    #[test]
+    fn serve_accepts_any_nonzero_u16_https_port() {
+        assert_eq!(parse_https_port("1").unwrap(), 1);
+        assert_eq!(parse_https_port("65535").unwrap(), 65535);
+        assert!(parse_https_port("0").is_err());
     }
 
     fn share_args(arguments: &[&str]) -> ShareArgs {

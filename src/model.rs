@@ -7,7 +7,7 @@ pub const MAX_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Availability {
     Installable,
-    /// `--max-downloads` is spent.
+    /// `--max-downloads` has been reached by successful downloads.
     LimitReached,
     /// `--expire-after` has elapsed.
     Expired,

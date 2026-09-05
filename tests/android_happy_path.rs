@@ -97,7 +97,7 @@ async fn apk_download_has_android_mime_and_matches_the_signed_fixture() {
 }
 
 #[tokio::test]
-async fn one_android_grant_covers_range_retries_and_then_closes_new_downloads() {
+async fn one_android_grant_covers_range_retries_and_closes_new_downloads_after_completion() {
     let server = support::spawn_android_server(SpawnOptions {
         share_config: ShareConfig {
             max_downloads: Some(1),
@@ -130,6 +130,16 @@ async fn one_android_grant_covers_range_retries_and_then_closes_new_downloads() 
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(response.bytes().await.unwrap().len(), 16);
     }
+
+    // The Range responses above are successful pieces, not a completed APK
+    // download. The same grant remains usable for the final full transfer,
+    // which is the point at which max-downloads is spent.
+    let complete = client.get(&download).send().await.unwrap();
+    assert_eq!(complete.status(), StatusCode::OK);
+    assert_eq!(
+        complete.bytes().await.unwrap().as_ref(),
+        server.artifact_bytes.as_slice()
+    );
 
     let bare_download = server.url(&format!(
         "/api/v1/artifacts/{}/download.apk",
