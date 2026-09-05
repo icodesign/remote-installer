@@ -87,7 +87,7 @@ remote-installer share /path/to/MyApp.app
 2. Open the link in the phone browser or scan the QR code with the camera.
 3. Tap **Install**.
 
-![Download Screenshot](./assets/download.webp)
+<img src="./assets/download.webp" width="200" height="417"/>
 
 ## For AI agents
 
