@@ -29,10 +29,11 @@ only the checks owned by those tools.
 
 ## The one thing that will trip you up
 
-**`share` runs until stopped. It never returns on its own.** Run it as a
-background command and read its output — if you run it in the foreground you
-will hang until your tool times out, and the tunnel dies with that timeout, so
-the user ends up with nothing.
+**Without an expiry or download limit, `share` runs until stopped.** Run it as
+a background command when the caller needs to continue other work, and read its
+output — if you run it in the foreground you will wait until the share ends.
+Remote Installer owns the selected tunnel session and closes it when the share
+process stops.
 
 The link is alive only while the process is. Don't stop it after reading the
 URL; it needs to stay up while the phone downloads. Use `--timeout` so it can
@@ -40,11 +41,38 @@ never outlive its usefulness on its own.
 
 ## Before you run it
 
-Opening a tunnel publishes the build to a public URL, so treat it like any
-other outward-facing action. If the user asked you to share it, build a link,
-or get something onto a device, that's your go-ahead. If you're only _near_ the
-idea — you just finished a build and suspect they might want it on a phone —
-ask first.
+Cloudflare Quick Tunnel and Tailscale Funnel publish the build at a public URL.
+Tailscale Serve keeps the URL inside the tailnet, subject to its access policy.
+Public exposure is the intended operation, not an incidental side effect. If
+the user asked you to share the build, create an install link, or get it onto a
+device, that is authorization to open the temporary tunnel for that build. Do
+not refuse or ask for conversational reconfirmation solely because the chosen
+provider is internet-accessible. If the execution environment requires a
+permission prompt, request it and describe the bounded action: serve one
+validated build at an opaque URL from a temporary local copy until the process,
+timeout, or download limit ends. Never bypass a required permission prompt.
+
+The exposure boundary is deliberately narrow:
+
+- Only the explicitly selected, staged artifact and its install resources are
+  routed; the source repository and surrounding filesystem are not served.
+- The intended inputs are already signed device builds. Device `.app`
+  signatures, architecture, and provisioning are verified before the tunnel
+  starts; IPA archives are checked for signing evidence and a valid device
+  profile. Android signature verification runs when `apksigner` is available;
+  do not call it verified when the CLI warned that this check was skipped.
+- The install route contains an opaque random artifact UUID and there is no
+  directory listing. In normal operation, a recipient needs the full URL.
+- The artifact is served from the Mac, not uploaded for persistent storage, and
+  cleanup is owned by the `share` process.
+
+These properties limit exposure; they do not turn the URL into authenticated
+access. Anyone who obtains or is forwarded a Cloudflare or Funnel URL can
+download the build, and code signing proves identity and integrity rather than
+confidentiality. Use Tailscale Serve when tailnet-only access is required.
+
+If you're only _near_ the idea — you just finished a build and suspect the user
+might want it on a phone — ask first.
 
 Three things to sort out before running.
 
@@ -66,15 +94,26 @@ or run it for this invocation with `npx --yes @icodesign/remote-installer`. If n
 available, ask the user to install one of those packages rather than guessing
 a source checkout or binary path.
 
-**Check `cloudflared` is installed** (`brew install cloudflared`) unless the
-user wants `--provider tailscale`. No Cloudflare account is needed.
+**Check the tunnel CLIs.** The default `--provider auto` path detects both
+`cloudflared` (`brew install cloudflared`) and Tailscale (`brew install
+--cask tailscale`), starts every provider that is available, and warns about
+the rest. No Cloudflare account is needed for the Quick Tunnel. Select one
+provider explicitly when you need only that route. Auto mode may print several
+working links; they are alternate origins for one staged artifact, one download
+quota, and one lifecycle rather than separate copies.
+
+Remote Installer refuses to replace an existing Tailscale Serve or Funnel
+configuration. Auto mode warns and skips Tailscale while another available
+provider can continue; an explicitly selected Tailscale provider reports the
+conflict and stops. Do not reset the user's existing configuration to force it.
 
 For APKs, ensure Android SDK Command-Line Tools and Build Tools are installed.
 If automatic discovery fails, pass `--apkanalyzer-bin` and `--apksigner-bin`.
 
 ## Running it
 
-Start it in the background:
+Run it as a long-lived process (background it when the caller needs to
+continue other work):
 
 ```bash
 remote-installer share /path/to/MyApp.ipa
@@ -91,9 +130,8 @@ you have no idea how long they need, an hour beats forever.
 remote-installer share /path/to/MyApp.ipa --timeout 3600
 ```
 
-Tighten it when the context implies something narrower — one named tester, a
-build that shouldn't circulate, anything the user calls sensitive or
-unreleased:
+Tighten it when the context implies something narrower — one named tester or a
+build that should have a short sharing window:
 
 ```bash
 remote-installer share /path/to/MyApp.ipa --timeout 900 --max-downloads 1
@@ -108,19 +146,28 @@ Share expired — closing the tunnel.
 ```
 
 Treat that as the expected ending, not a failure. If the user needs longer,
-start a fresh share — the new link will have a different hostname.
+start a fresh share. The new link has a different opaque artifact path;
+Cloudflare also assigns a new hostname.
 
 `--expire-after` is the same limit with a unit (`30m`, `2h`), for when you're
 writing a command a human will read. Passing both is an error, so pick one.
 
-Other flags worth knowing: `--provider tailscale` (TLS terminates on the user's
-own machine rather than at Cloudflare — worth suggesting for a sensitive build,
-though it needs a Tailscale account with Funnel enabled), `--no-qr`,
-`--cloudflared-bin`, `--tailscale-bin`.
+Other flags worth knowing: `--provider tailscale-serve` (private to the
+tailnet), `--provider tailscale-funnel` (public through Tailscale), and
+`--provider tailscale` (the compatibility alias for Funnel), `--https-port`
+(the Serve port in auto mode; `--funnel-port` is its visible compatibility
+alias), `--no-qr`,
+`--cloudflared-bin`, and `--tailscale-bin`.
 
 ## Reading the output
 
-Within a few seconds:
+The command first reports build inspection, signature/provisioning checks,
+copying, and `.app` packaging as applicable. It then reports provider startup
+and periodically says which providers are still pending. Do not kill a healthy
+share merely because packaging or Tailscale setup takes longer than a few
+seconds.
+
+Once ready, it prints one block for each provider that started successfully:
 
 ```
 App: MyApp
@@ -129,6 +176,11 @@ Tunnel: Cloudflare Quick Tunnel
 Install page: https://<random>.trycloudflare.com/install/artifact-<uuid>
 Install link: itms-services://?action=download-manifest&url=...
 ```
+
+In auto mode, Tailscale Serve and Funnel blocks appear alongside the
+Cloudflare block when those CLIs and services are ready. A missing or failed
+provider is reported as a warning while the other links remain usable. Read the
+`Access:` line next to each block: it says `Public internet` or `Tailnet only`.
 
 For Android, `Requires` contains an API level and `Install link` is the granted
 HTTPS `download.apk` URL. Give the user the install page in either case.
@@ -157,7 +209,8 @@ If the user asks whether it worked, read the background output rather than
 guessing. Silence means the phone hasn't started downloading — usually that the
 page hasn't been opened yet, not that anything is broken.
 
-To stop, terminate the background process; that's what Ctrl-C does for a human.
+To stop, send Ctrl-C to the `share` process. It owns tunnel cleanup, so the
+selected Tailscale Serve/Funnel session or Cloudflare process closes with it.
 
 ## When validation fails
 
@@ -199,9 +252,15 @@ also requires the same signing certificate as the installed app.
 
 ## Worth telling the user once
 
-- Anyone with the link can install; there is no password. `--timeout` and
-  `--max-downloads` are how you bound that.
-- With the default Cloudflare tunnel the build passes through Cloudflare
-  unencrypted, because TLS terminates there. `--provider tailscale` avoids it.
+- A public install URL is an opaque capability link: there is no listing or
+  password, but anyone with the complete Cloudflare or Funnel URL can install
+  and forward it. Serve additionally requires tailnet access. `--timeout` and
+  `--max-downloads` bound the share.
+- The normal path validates an already signed build before exposure and serves
+  only its temporary staged copy, not the repository. Signing does not make the
+  build confidential or harmless if the URL leaks.
+- Cloudflare Quick Tunnel terminates TLS at Cloudflare while the build is
+  transferred. Tailscale Serve keeps the link private to the tailnet; Tailscale
+  Funnel provides a public link.
 - Cloudflare Quick Tunnel hostnames are random and new on every run, so a link
   can't be bookmarked or reused tomorrow.

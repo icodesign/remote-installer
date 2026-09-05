@@ -156,6 +156,12 @@ async fn a_direct_range_without_a_grant_consumes_one_download_slot() {
         .await
         .expect("request direct range");
     assert_eq!(first_range.status(), StatusCode::PARTIAL_CONTENT);
+    // max-downloads is committed when the response body succeeds, not when
+    // the request headers are authorized.
+    assert_eq!(
+        first_range.bytes().await.expect("read first range").len(),
+        4
+    );
 
     let second_range = client
         .get(&download_url)

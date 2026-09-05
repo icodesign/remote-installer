@@ -1,5 +1,4 @@
 use std::collections::VecDeque;
-use std::future::pending;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
@@ -13,8 +12,12 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, sleep};
+use tokio::time::{Instant, sleep, timeout};
 use url::Url;
+
+const TAILSCALE_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+const TAILSCALE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const TAILSCALE_DNS_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
 const TAILSCALE_APP_CLI: &str = "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 const CLOUDFLARED_HOMEBREW_CLI: &str = "/opt/homebrew/bin/cloudflared";
@@ -39,14 +42,18 @@ install Tailscale with one of the following:
   - brew install --cask tailscale
   - the Mac App Store, or https://tailscale.com/download
 
-Note: Tailscale Funnel requires a Tailscale account and a tailnet with Funnel enabled, unlike
-the Cloudflare path above. If you'd rather not create an account, pass --provider cloudflare
-to use the Cloudflare Quick Tunnel instead.
+Note: Tailscale Serve and Funnel require a Tailscale account. Serve keeps the link private to
+your tailnet; Funnel exposes it publicly and also requires Funnel to be enabled. If you'd
+rather not create an account, pass --provider cloudflare to use the Cloudflare Quick Tunnel.
 If Tailscale is installed somewhere else, pass --tailscale-bin /path/to/tailscale.
 Already checked: $PATH, /Applications/Tailscale.app/Contents/MacOS/Tailscale.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExposureProvider {
+    TailscaleServe,
+    TailscaleFunnel,
+    /// Compatibility alias for the former single Tailscale provider, which
+    /// exposed a public Funnel URL.
     Tailscale,
     Cloudflare,
 }
@@ -54,8 +61,39 @@ pub enum ExposureProvider {
 impl ExposureProvider {
     pub fn name(self) -> &'static str {
         match self {
-            Self::Tailscale => "Tailscale Funnel",
+            Self::TailscaleServe => "Tailscale Serve",
+            Self::TailscaleFunnel | Self::Tailscale => "Tailscale Funnel",
             Self::Cloudflare => "Cloudflare Quick Tunnel",
+        }
+    }
+
+    fn tailscale_mode(self) -> Option<TailscaleMode> {
+        match self {
+            Self::TailscaleServe => Some(TailscaleMode::Serve),
+            Self::TailscaleFunnel | Self::Tailscale => Some(TailscaleMode::Funnel),
+            Self::Cloudflare => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TailscaleMode {
+    Serve,
+    Funnel,
+}
+
+impl TailscaleMode {
+    fn command(self) -> &'static str {
+        match self {
+            Self::Serve => "serve",
+            Self::Funnel => "funnel",
+        }
+    }
+
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Serve => "Serve",
+            Self::Funnel => "Funnel",
         }
     }
 }
@@ -73,8 +111,10 @@ pub enum ExposureError {
     Json(#[from] serde_json::Error),
     #[error("Tailscale is not ready: {0}")]
     TailscaleNotReady(String),
-    #[error("an existing Tailscale Funnel configuration is active; refusing to replace it")]
-    ExistingTailscaleConfiguration,
+    #[error("an existing Tailscale {mode} configuration is active; refusing to replace it")]
+    ExistingTailscaleConfiguration { mode: &'static str },
+    #[error("Tailscale {mode} requires a valid HTTPS port, got {port}")]
+    InvalidTailscalePort { mode: &'static str, port: u16 },
     #[error("{program} failed: {message}")]
     Command {
         program: &'static str,
@@ -82,6 +122,12 @@ pub enum ExposureError {
     },
     #[error("tunnel provider reported an invalid public URL: {0}")]
     InvalidPublicUrl(String),
+    #[error("Tailscale session exited: {0}")]
+    TailscaleExited(String),
+    #[error(
+        "Tailscale did not become ready within 120 seconds; complete the setup shown above and retry{0}"
+    )]
+    TailscaleStartupTimeout(String),
     #[error("Cloudflare Quick Tunnel did not become ready within 30 seconds{0}")]
     CloudflareStartupTimeout(String),
     #[error("cloudflared exited before the sharing session ended{0}")]
@@ -93,6 +139,7 @@ pub enum ExposureError {
 pub struct ExposureSession {
     provider: ExposureProvider,
     public_base_url: Url,
+    warnings: Vec<String>,
     inner: ExposureSessionInner,
 }
 
@@ -101,10 +148,10 @@ enum ExposureSessionInner {
     Cloudflare(CloudflareSession),
 }
 
-#[derive(Debug)]
 struct TailscaleSession {
-    binary: PathBuf,
-    https_port: u16,
+    child: Child,
+    captured_logs: CapturedLogs,
+    log_tasks: Vec<JoinHandle<()>>,
 }
 
 struct CloudflareSession {
@@ -127,7 +174,21 @@ struct TailscaleStatus {
 #[derive(Debug, Deserialize)]
 struct TailscaleNode {
     #[serde(rename = "DNSName")]
-    dns_name: String,
+    dns_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TailscaleDnsStatus {
+    #[serde(rename = "TailscaleDNS")]
+    tailscale_dns: bool,
+    #[serde(rename = "CurrentTailnet")]
+    current_tailnet: TailscaleCurrentTailnet,
+}
+
+#[derive(Debug, Deserialize)]
+struct TailscaleCurrentTailnet {
+    #[serde(rename = "MagicDNSEnabled")]
+    magic_dns_enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -143,12 +204,98 @@ impl ExposureSession {
         cloudflared_binary: Option<&Path>,
         tailscale_https_port: u16,
     ) -> Result<Self, ExposureError> {
+        Self::start_with_options(
+            provider,
+            target,
+            tailscale_binary,
+            cloudflared_binary,
+            tailscale_https_port,
+            true,
+        )
+        .await
+    }
+
+    /// Start a provider after the caller has performed one shared Tailscale
+    /// preflight. Auto mode uses this for its parallel Serve/Funnel starts so
+    /// the second child does not mistake the first child that this same command
+    /// just created for a pre-existing user configuration.
+    pub async fn start_without_configuration_check(
+        provider: ExposureProvider,
+        target: &Url,
+        tailscale_binary: Option<&Path>,
+        cloudflared_binary: Option<&Path>,
+        tailscale_https_port: u16,
+    ) -> Result<Self, ExposureError> {
+        Self::start_with_options(
+            provider,
+            target,
+            tailscale_binary,
+            cloudflared_binary,
+            tailscale_https_port,
+            false,
+        )
+        .await
+    }
+
+    async fn start_with_options(
+        provider: ExposureProvider,
+        target: &Url,
+        tailscale_binary: Option<&Path>,
+        cloudflared_binary: Option<&Path>,
+        tailscale_https_port: u16,
+        check_existing_tailscale_configuration: bool,
+    ) -> Result<Self, ExposureError> {
         match provider {
-            ExposureProvider::Tailscale => {
-                start_tailscale(target, tailscale_binary, tailscale_https_port).await
+            ExposureProvider::TailscaleServe
+            | ExposureProvider::TailscaleFunnel
+            | ExposureProvider::Tailscale => {
+                let mode = provider
+                    .tailscale_mode()
+                    .expect("matched a Tailscale provider");
+                start_tailscale(
+                    mode,
+                    target,
+                    tailscale_binary,
+                    tailscale_https_port,
+                    check_existing_tailscale_configuration,
+                )
+                .await
             }
             ExposureProvider::Cloudflare => start_cloudflare(target, cloudflared_binary).await,
         }
+    }
+
+    /// Check that the Tailscale CLI can serve this process and that no
+    /// existing Serve/Funnel configuration would be overwritten by auto mode.
+    pub async fn check_tailscale_for_auto(
+        binary_override: Option<&Path>,
+    ) -> Result<(), ExposureError> {
+        let binary = discover_binary(
+            "Tailscale",
+            "tailscale",
+            binary_override,
+            &[TAILSCALE_APP_CLI],
+            TAILSCALE_INSTALL_HINT,
+        )?;
+        let status: TailscaleStatus = command_json(&binary, &["status", "--json"]).await?;
+        if status.backend_state != "Running" {
+            return Err(ExposureError::TailscaleNotReady(format!(
+                "backend state is {}",
+                status.backend_state
+            )));
+        }
+        status
+            .self_node
+            .and_then(|node| node.dns_name)
+            .filter(|name| !name.trim_matches('.').is_empty())
+            .ok_or_else(|| {
+                ExposureError::TailscaleNotReady("the current node has no MagicDNS name".into())
+            })?;
+        // Check both modes before either child is spawned. Serve and Funnel
+        // keep separate foreground entries, so checking only Serve could let
+        // auto mode overwrite a user's existing Funnel configuration.
+        ensure_empty_tailscale_configuration(&binary, TailscaleMode::Serve).await?;
+        ensure_empty_tailscale_configuration(&binary, TailscaleMode::Funnel).await
     }
 
     pub fn provider(&self) -> ExposureProvider {
@@ -159,9 +306,13 @@ impl ExposureSession {
         &self.public_base_url
     }
 
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
     pub async fn wait_for_exit(&mut self) -> Result<(), ExposureError> {
         match &mut self.inner {
-            ExposureSessionInner::Tailscale(_) => pending().await,
+            ExposureSessionInner::Tailscale(session) => session.wait_for_exit().await,
             ExposureSessionInner::Cloudflare(session) => session.wait_for_exit().await,
         }
     }
@@ -175,16 +326,55 @@ impl ExposureSession {
 }
 
 impl TailscaleSession {
-    async fn stop(&self) -> Result<(), ExposureError> {
-        let port_flag = format!("--https={}", self.https_port);
-        run_checked(
-            "Tailscale",
-            &self.binary,
-            &["funnel", port_flag.as_str(), "off"],
-        )
-        .await
-        .map(|_| ())
+    async fn wait_for_exit(&mut self) -> Result<(), ExposureError> {
+        let status = self.child.wait().await?;
+        self.finish_logs().await;
+        Err(ExposureError::TailscaleExited(format!(
+            "{status}\n{}",
+            self.captured_logs.snapshot().await
+        )))
     }
+
+    async fn stop(&mut self) -> Result<(), ExposureError> {
+        if self.child.try_wait()?.is_none() {
+            self.child.start_kill()?;
+        }
+        self.child.wait().await?;
+        self.finish_logs().await;
+        Ok(())
+    }
+
+    async fn finish_logs(&mut self) {
+        for task in self.log_tasks.drain(..) {
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for TailscaleSession {
+    fn drop(&mut self) {
+        // Foreground config belongs to this child's IPN bus session. Killing
+        // the child closes that session, including when startup is cancelled.
+        let _ = self.child.start_kill();
+        for task in &self.log_tasks {
+            task.abort();
+        }
+    }
+}
+
+fn tailscale_log_task(
+    stream: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    captured: CapturedLogs,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stream).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            // In particular, HTTPS/Funnel first-use authorization URLs must
+            // reach the user before the child completes its setup.
+            eprintln!("{line}");
+            captured.push(line).await;
+        }
+    })
 }
 
 impl CloudflareSession {
@@ -234,10 +424,13 @@ impl CapturedLogs {
 }
 
 async fn start_tailscale(
+    mode: TailscaleMode,
     target: &Url,
     binary_override: Option<&Path>,
     https_port: u16,
+    check_existing_tailscale_configuration: bool,
 ) -> Result<ExposureSession, ExposureError> {
+    validate_tailscale_port(mode, https_port)?;
     let binary = discover_binary(
         "Tailscale",
         "tailscale",
@@ -254,32 +447,113 @@ async fn start_tailscale(
     }
     let dns_name = status
         .self_node
-        .map(|node| node.dns_name)
+        .and_then(|node| node.dns_name)
         .filter(|name| !name.trim_matches('.').is_empty())
         .ok_or_else(|| {
             ExposureError::TailscaleNotReady("the current node has no MagicDNS name".into())
         })?;
-    ensure_empty_tailscale_configuration(&binary).await?;
+    if check_existing_tailscale_configuration {
+        ensure_empty_tailscale_configuration(&binary, mode).await?;
+    }
+    let warnings = tailscale_dns_diagnostics(&binary, mode).await?;
 
     let public_base_url = tailscale_public_url(&dns_name, https_port)?;
     let port_flag = format!("--https={https_port}");
-    run_checked(
-        "Tailscale",
-        &binary,
-        &[
-            "funnel",
-            "--yes",
-            "--bg",
-            port_flag.as_str(),
-            target.as_str(),
-        ],
-    )
-    .await?;
+    let mut child = Command::new(&binary)
+        .args([mode.command(), "--yes", port_flag.as_str(), target.as_str()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let captured_logs = CapturedLogs::default();
+    let log_tasks = vec![
+        tailscale_log_task(
+            child.stdout.take().expect("piped stdout"),
+            captured_logs.clone(),
+        ),
+        tailscale_log_task(
+            child.stderr.take().expect("piped stderr"),
+            captured_logs.clone(),
+        ),
+    ];
+    let mut session = TailscaleSession {
+        child,
+        captured_logs,
+        log_tasks,
+    };
+    let readiness = async {
+        loop {
+            let current: Value =
+                command_json(&binary, &[mode.command(), "status", "--json"]).await?;
+            if tailscale_configuration_ready(&current, mode, &dns_name, https_port, target) {
+                return Ok::<(), ExposureError>(());
+            }
+            sleep(TAILSCALE_POLL_INTERVAL).await;
+        }
+    };
+    let ready = tokio::select! {
+        result = readiness => result,
+        result = session.wait_for_exit() => result,
+        _ = sleep(TAILSCALE_STARTUP_TIMEOUT) => Err(ExposureError::TailscaleStartupTimeout(
+            format!("\n{}", session.captured_logs.snapshot().await)
+        )),
+    };
+    if let Err(error) = ready {
+        session.stop().await?;
+        return Err(error);
+    }
+    if let Some(status) = session.child.try_wait()? {
+        return Err(ExposureError::TailscaleExited(status.to_string()));
+    }
     Ok(ExposureSession {
-        provider: ExposureProvider::Tailscale,
+        provider: match mode {
+            TailscaleMode::Serve => ExposureProvider::TailscaleServe,
+            TailscaleMode::Funnel => ExposureProvider::TailscaleFunnel,
+        },
         public_base_url,
-        inner: ExposureSessionInner::Tailscale(TailscaleSession { binary, https_port }),
+        warnings,
+        inner: ExposureSessionInner::Tailscale(session),
     })
+}
+
+// Use structured daemon state, not localized human-facing output, as readiness.
+// Only the exact ephemeral HTTPS proxy and requested visibility qualify.
+fn tailscale_configuration_ready(
+    config: &Value,
+    mode: TailscaleMode,
+    dns_name: &str,
+    port: u16,
+    target: &Url,
+) -> bool {
+    let host_port = format!("{}:{port}", dns_name.trim_end_matches('.'));
+    config
+        .get("Foreground")
+        .and_then(Value::as_object)
+        .is_some_and(|sessions| {
+            sessions.values().any(|session| {
+                let proxy = session["Web"][&host_port]["Handlers"]["/"]["Proxy"]
+                    .as_str()
+                    .and_then(|value| Url::parse(value).ok());
+                session["TCP"][port.to_string()]["HTTPS"].as_bool() == Some(true)
+                    && proxy.as_ref() == Some(target)
+                    && session["AllowFunnel"][&host_port]
+                        .as_bool()
+                        .unwrap_or(false)
+                        == (mode == TailscaleMode::Funnel)
+            })
+        })
+}
+
+fn validate_tailscale_port(mode: TailscaleMode, port: u16) -> Result<(), ExposureError> {
+    let supported = mode == TailscaleMode::Serve || matches!(port, 443 | 8443 | 10000);
+    if port == 0 || !supported {
+        return Err(ExposureError::InvalidTailscalePort {
+            mode: mode.display_name(),
+            port,
+        });
+    }
+    Ok(())
 }
 
 async fn start_cloudflare(
@@ -378,6 +652,7 @@ async fn start_cloudflare_once(
             return Ok(ExposureSession {
                 provider: ExposureProvider::Cloudflare,
                 public_base_url,
+                warnings: Vec::new(),
                 inner: ExposureSessionInner::Cloudflare(CloudflareSession {
                     child,
                     captured_logs,
@@ -396,13 +671,69 @@ async fn start_cloudflare_once(
     )))
 }
 
-async fn ensure_empty_tailscale_configuration(binary: &Path) -> Result<(), ExposureError> {
-    let current: Value = command_json(binary, &["funnel", "status", "--json"]).await?;
+async fn ensure_empty_tailscale_configuration(
+    binary: &Path,
+    mode: TailscaleMode,
+) -> Result<(), ExposureError> {
+    let current: Value = command_json(binary, &[mode.command(), "status", "--json"]).await?;
     if empty_configuration(&current) {
         Ok(())
     } else {
-        Err(ExposureError::ExistingTailscaleConfiguration)
+        Err(ExposureError::ExistingTailscaleConfiguration {
+            mode: mode.display_name(),
+        })
     }
+}
+
+async fn tailscale_dns_diagnostics(
+    binary: &Path,
+    mode: TailscaleMode,
+) -> Result<Vec<String>, ExposureError> {
+    let unavailable = |detail: String| {
+        format!(
+            "could not inspect Tailscale DNS configuration ({detail}); run `tailscale dns status --json` or update Tailscale"
+        )
+    };
+    let status: TailscaleDnsStatus = match timeout(
+        TAILSCALE_DNS_STATUS_TIMEOUT,
+        command_json(binary, &["dns", "status", "--json"]),
+    )
+    .await
+    {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            return Err(ExposureError::TailscaleNotReady(unavailable(
+                error.to_string(),
+            )));
+        }
+        Err(_) => {
+            return Err(ExposureError::TailscaleNotReady(unavailable(
+                "command timed out after 5 seconds".into(),
+            )));
+        }
+    };
+
+    if !status.current_tailnet.magic_dns_enabled && mode == TailscaleMode::Funnel {
+        return Err(ExposureError::TailscaleNotReady(
+            "Tailscale Funnel requires MagicDNS; enable MagicDNS in the Tailscale admin console DNS settings before using Funnel"
+                .into(),
+        ));
+    }
+
+    let mut warnings = Vec::new();
+    if !status.current_tailnet.magic_dns_enabled {
+        warnings.push(
+            "MagicDNS is disabled for this tailnet. Tailscale Serve can start, but receiving devices must use Tailscale DNS or another correctly configured resolver for the Serve hostname; enable MagicDNS in the Tailscale admin console DNS settings."
+                .into(),
+        );
+    }
+    if mode == TailscaleMode::Serve && !status.tailscale_dns {
+        warnings.push(
+            "Tailscale DNS is disabled on this computer. Serve can start, but this computer may not resolve its Serve hostname; run `tailscale set --accept-dns=true`. Receiving devices such as your phone must use Tailscale DNS or another correctly configured resolver."
+                .into(),
+        );
+    }
+    Ok(warnings)
 }
 
 fn discover_binary(
@@ -412,14 +743,27 @@ fn discover_binary(
     standard_paths: &[&str],
     install_hint: &'static str,
 ) -> Result<PathBuf, ExposureError> {
+    resolve_binary(executable_name, binary_override, standard_paths).ok_or(
+        ExposureError::CliNotFound {
+            display_name,
+            install_hint,
+        },
+    )
+}
+
+fn resolve_binary(
+    executable_name: &str,
+    binary_override: Option<&Path>,
+    standard_paths: &[&str],
+) -> Option<PathBuf> {
     if let Some(path) = binary_override {
-        return Ok(path.to_path_buf());
+        return path.is_file().then(|| path.to_path_buf());
     }
     if let Some(path) = std::env::var_os("PATH") {
         for directory in std::env::split_paths(&path) {
             let candidate = directory.join(executable_name);
             if candidate.is_file() {
-                return Ok(candidate);
+                return Some(candidate);
             }
         }
     }
@@ -427,10 +771,29 @@ fn discover_binary(
         .iter()
         .map(PathBuf::from)
         .find(|candidate| candidate.is_file())
-        .ok_or(ExposureError::CliNotFound {
-            display_name,
-            install_hint,
-        })
+}
+
+/// Whether the executable for a provider is present and can therefore be
+/// attempted by default auto mode. Explicit provider selection still runs the
+/// normal discovery path so a missing binary retains its detailed install hint.
+pub fn provider_binary_available(
+    provider: ExposureProvider,
+    tailscale_binary: Option<&Path>,
+    cloudflared_binary: Option<&Path>,
+) -> bool {
+    match provider {
+        ExposureProvider::TailscaleServe
+        | ExposureProvider::TailscaleFunnel
+        | ExposureProvider::Tailscale => {
+            resolve_binary("tailscale", tailscale_binary, &[TAILSCALE_APP_CLI]).is_some()
+        }
+        ExposureProvider::Cloudflare => resolve_binary(
+            "cloudflared",
+            cloudflared_binary,
+            &[CLOUDFLARED_HOMEBREW_CLI, CLOUDFLARED_USR_LOCAL_CLI],
+        )
+        .is_some(),
+    }
 }
 
 async fn command_json<T: serde::de::DeserializeOwned>(
@@ -446,7 +809,11 @@ async fn run_checked(
     binary: &Path,
     arguments: &[&str],
 ) -> Result<Output, ExposureError> {
-    let output = Command::new(binary).args(arguments).output().await?;
+    let output = Command::new(binary)
+        .args(arguments)
+        .kill_on_drop(true)
+        .output()
+        .await?;
     if output.status.success() {
         return Ok(output);
     }
@@ -553,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_the_tailscale_funnel_url() {
+    fn builds_the_tailscale_url() {
         assert_eq!(
             tailscale_public_url("mac.example.ts.net.", 443)
                 .unwrap()
@@ -565,6 +932,12 @@ mod tests {
                 .unwrap()
                 .as_str(),
             "https://mac.example.ts.net:8443/"
+        );
+        assert_eq!(
+            tailscale_public_url("mac.example.ts.net.", 8080)
+                .unwrap()
+                .as_str(),
+            "https://mac.example.ts.net:8080/"
         );
     }
 
@@ -607,36 +980,92 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(status.backend_state, "Running");
-        assert_eq!(status.self_node.unwrap().dns_name, "mac.example.ts.net.");
+        assert_eq!(
+            status.self_node.unwrap().dns_name.as_deref(),
+            Some("mac.example.ts.net.")
+        );
+    }
+
+    #[test]
+    fn validates_tailscale_port_rules_by_mode() {
+        assert!(validate_tailscale_port(TailscaleMode::Serve, 1).is_ok());
+        assert!(validate_tailscale_port(TailscaleMode::Serve, u16::MAX).is_ok());
+        assert!(validate_tailscale_port(TailscaleMode::Serve, 0).is_err());
+        assert!(validate_tailscale_port(TailscaleMode::Funnel, 443).is_ok());
+        assert!(validate_tailscale_port(TailscaleMode::Funnel, 8443).is_ok());
+        assert!(validate_tailscale_port(TailscaleMode::Funnel, 10000).is_ok());
+        assert!(validate_tailscale_port(TailscaleMode::Funnel, 8080).is_err());
+        assert!(validate_tailscale_port(TailscaleMode::Funnel, 0).is_err());
+    }
+
+    #[test]
+    fn provider_availability_uses_each_provider_override_independently() {
+        let temporary = tempfile::tempdir().unwrap();
+        let tailscale = temporary.path().join("tailscale");
+        let cloudflared = temporary.path().join("cloudflared");
+        std::fs::write(&tailscale, b"").unwrap();
+        std::fs::write(&cloudflared, b"").unwrap();
+
+        assert!(provider_binary_available(
+            ExposureProvider::TailscaleServe,
+            Some(&tailscale),
+            None,
+        ));
+        assert!(provider_binary_available(
+            ExposureProvider::TailscaleFunnel,
+            Some(&tailscale),
+            Some(&temporary.path().join("missing-cloudflared")),
+        ));
+        assert!(provider_binary_available(
+            ExposureProvider::Cloudflare,
+            Some(&temporary.path().join("missing-tailscale")),
+            Some(&cloudflared),
+        ));
+        assert!(!provider_binary_available(
+            ExposureProvider::Cloudflare,
+            None,
+            Some(&temporary.path().join("missing-cloudflared")),
+        ));
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn owns_only_the_tailscale_port_it_started() {
-        use std::os::unix::fs::PermissionsExt;
-
+    async fn auto_preflight_checks_both_tailscale_modes_before_starting() {
         let temporary = tempfile::tempdir().unwrap();
         let binary = temporary.path().join("tailscale");
         let log = temporary.path().join("commands.log");
-        let script = format!(
-            r#"#!/bin/sh
-printf '%s\n' "$*" >> '{}'
-if [ "$1" = "status" ]; then
-  printf '%s\n' '{{"BackendState":"Running","Self":{{"DNSName":"mac.example.ts.net."}}}}'
-elif [ "$1" = "funnel" ] && [ "$2" = "status" ]; then
-  printf '%s\n' '{{}}'
-fi
-"#,
-            log.display()
+        write_fake_tailscale(
+            &binary,
+            &log,
+            r#"{"BackendState":"Running","Self":{"DNSName":"mac.example.ts.net."}}"#,
+            "{}",
         );
-        std::fs::write(&binary, script).unwrap();
-        let mut permissions = std::fs::metadata(&binary).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&binary, permissions).unwrap();
+
+        ExposureSession::check_tailscale_for_auto(Some(&binary))
+            .await
+            .unwrap();
+        let commands = std::fs::read_to_string(log).unwrap();
+        assert!(commands.contains("status --json"));
+        assert!(commands.contains("serve status --json"));
+        assert!(commands.contains("funnel status --json"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owns_the_tailscale_funnel_foreground_process() {
+        let temporary = tempfile::tempdir().unwrap();
+        let binary = temporary.path().join("tailscale");
+        let log = temporary.path().join("commands.log");
+        write_fake_tailscale(
+            &binary,
+            &log,
+            r#"{"BackendState":"Running","Self":{"DNSName":"mac.example.ts.net."}}"#,
+            "{}",
+        );
 
         let target = Url::parse("http://127.0.0.1:49152").unwrap();
         let mut session = ExposureSession::start(
-            ExposureProvider::Tailscale,
+            ExposureProvider::TailscaleFunnel,
             &target,
             Some(&binary),
             None,
@@ -648,10 +1077,649 @@ fi
 
         let commands = std::fs::read_to_string(log).unwrap();
         assert!(commands.contains("status --json"));
-        assert_eq!(commands.matches("funnel status --json").count(), 1);
-        assert!(commands.contains("funnel --yes --bg --https=443 http://127.0.0.1:49152/"));
-        assert!(commands.contains("funnel --https=443 off"));
+        assert!(commands.matches("funnel status --json").count() >= 2);
+        assert!(commands.contains("funnel --yes --https=443 http://127.0.0.1:49152/"));
+        assert!(!commands.contains(" off"));
+        assert!(!commands.contains("--bg"));
+        assert_fake_child_exited(&binary);
         assert!(!commands.contains("reset"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owns_the_tailscale_serve_foreground_process() {
+        let temporary = tempfile::tempdir().unwrap();
+        let binary = temporary.path().join("tailscale");
+        let log = temporary.path().join("commands.log");
+        write_fake_tailscale(
+            &binary,
+            &log,
+            r#"{"BackendState":"Running","Self":{"DNSName":"mac.example.ts.net."}}"#,
+            "{}",
+        );
+
+        let target = Url::parse("http://127.0.0.1:49152").unwrap();
+        let mut session = ExposureSession::start(
+            ExposureProvider::TailscaleServe,
+            &target,
+            Some(&binary),
+            None,
+            8080,
+        )
+        .await
+        .unwrap();
+        assert_eq!(session.provider(), ExposureProvider::TailscaleServe);
+        assert_eq!(
+            session.public_base_url().as_str(),
+            "https://mac.example.ts.net:8080/"
+        );
+        session.stop().await.unwrap();
+
+        let commands = std::fs::read_to_string(log).unwrap();
+        assert!(commands.matches("serve status --json").count() >= 2);
+        assert!(commands.contains("serve --yes --https=8080 http://127.0.0.1:49152/"));
+        assert!(!commands.contains(" off"));
+        assert!(!commands.contains("--bg"));
+        assert_fake_child_exited(&binary);
+        assert!(!commands.contains("funnel"));
+        assert!(!commands.contains("reset"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn warns_when_local_tailscale_dns_is_disabled_for_serve() {
+        let temporary = tempfile::tempdir().unwrap();
+        let binary = temporary.path().join("tailscale");
+        write_fake_tailscale(
+            &binary,
+            &temporary.path().join("commands.log"),
+            r#"{"BackendState":"Running","Self":{"DNSName":"mac.example.ts.net."}}"#,
+            "{}",
+        );
+        write_fake_dns_status(
+            &binary,
+            r#"{"TailscaleDNS":false,"CurrentTailnet":{"MagicDNSEnabled":true,"SelfDNSName":"mac.example.ts.net."}}"#,
+        );
+
+        let target = Url::parse("http://127.0.0.1:49152").unwrap();
+        let mut session = ExposureSession::start(
+            ExposureProvider::TailscaleServe,
+            &target,
+            Some(&binary),
+            None,
+            443,
+        )
+        .await
+        .unwrap();
+        assert_eq!(session.warnings().len(), 1);
+        assert!(session.warnings()[0].contains("tailscale set --accept-dns=true"));
+        assert!(
+            session.warnings()[0]
+                .to_ascii_lowercase()
+                .contains("receiving devices")
+        );
+        session.stop().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn warns_when_tailnet_magicdns_is_disabled_for_serve() {
+        let temporary = tempfile::tempdir().unwrap();
+        let binary = temporary.path().join("tailscale");
+        write_fake_tailscale(
+            &binary,
+            &temporary.path().join("commands.log"),
+            r#"{"BackendState":"Running","Self":{"DNSName":"mac.example.ts.net."}}"#,
+            "{}",
+        );
+        write_fake_dns_status(
+            &binary,
+            r#"{"TailscaleDNS":true,"CurrentTailnet":{"MagicDNSEnabled":false,"SelfDNSName":"mac.example.ts.net."}}"#,
+        );
+
+        let target = Url::parse("http://127.0.0.1:49152").unwrap();
+        let mut session = ExposureSession::start(
+            ExposureProvider::TailscaleServe,
+            &target,
+            Some(&binary),
+            None,
+            443,
+        )
+        .await
+        .unwrap();
+        assert_eq!(session.warnings().len(), 1);
+        assert!(session.warnings()[0].contains("MagicDNS is disabled"));
+        assert!(
+            session.warnings()[0]
+                .to_ascii_lowercase()
+                .contains("receiving devices")
+        );
+        session.stop().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn accepts_disabled_local_tailscale_dns_for_funnel_without_warning() {
+        let temporary = tempfile::tempdir().unwrap();
+        let binary = temporary.path().join("tailscale");
+        write_fake_tailscale(
+            &binary,
+            &temporary.path().join("commands.log"),
+            r#"{"BackendState":"Running","Self":{"DNSName":"mac.example.ts.net."}}"#,
+            "{}",
+        );
+        write_fake_dns_status(
+            &binary,
+            r#"{"TailscaleDNS":false,"CurrentTailnet":{"MagicDNSEnabled":true,"SelfDNSName":"mac.example.ts.net."}}"#,
+        );
+
+        let target = Url::parse("http://127.0.0.1:49152").unwrap();
+        let mut session = ExposureSession::start(
+            ExposureProvider::TailscaleFunnel,
+            &target,
+            Some(&binary),
+            None,
+            443,
+        )
+        .await
+        .unwrap();
+        assert!(session.warnings().is_empty());
+        session.stop().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_funnel_when_tailnet_magicdns_is_disabled_before_spawning() {
+        let temporary = tempfile::tempdir().unwrap();
+        let binary = temporary.path().join("tailscale");
+        write_fake_tailscale(
+            &binary,
+            &temporary.path().join("commands.log"),
+            r#"{"BackendState":"Running","Self":{"DNSName":"mac.example.ts.net."}}"#,
+            "{}",
+        );
+        write_fake_dns_status(
+            &binary,
+            r#"{"TailscaleDNS":true,"CurrentTailnet":{"MagicDNSEnabled":false,"SelfDNSName":"mac.example.ts.net."}}"#,
+        );
+
+        let target = Url::parse("http://127.0.0.1:49152").unwrap();
+        let error = ExposureSession::start(
+            ExposureProvider::TailscaleFunnel,
+            &target,
+            Some(&binary),
+            None,
+            443,
+        )
+        .await
+        .err()
+        .expect("MagicDNS-disabled Funnel should be rejected before spawning");
+        assert!(
+            error
+                .to_string()
+                .contains("enable MagicDNS in the Tailscale admin console DNS settings")
+        );
+        assert!(!binary.with_extension("pid").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_malformed_or_failed_tailscale_dns_diagnostics_before_spawning() {
+        for failure in ["malformed", "missing", "failed"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let binary = temporary.path().join("tailscale");
+            write_fake_tailscale(
+                &binary,
+                &temporary.path().join("commands.log"),
+                r#"{"BackendState":"Running","Self":{"DNSName":"mac.example.ts.net."}}"#,
+                "{}",
+            );
+            if failure == "malformed" {
+                write_fake_dns_status(&binary, "not-json");
+            } else if failure == "missing" {
+                write_fake_dns_status(&binary, r#"{"TailscaleDNS":true,"CurrentTailnet":{}}"#);
+            } else {
+                mark_fake_dns_status_failed(&binary);
+            }
+
+            let target = Url::parse("http://127.0.0.1:49152").unwrap();
+            let error = ExposureSession::start(
+                ExposureProvider::TailscaleServe,
+                &target,
+                Some(&binary),
+                None,
+                443,
+            )
+            .await
+            .err()
+            .expect("invalid DNS diagnostics should be reported before spawning");
+            assert!(error.to_string().contains("tailscale dns status --json"));
+            assert!(!binary.with_extension("pid").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn times_out_tailscale_dns_diagnostics_before_spawning() {
+        let temporary = tempfile::tempdir().unwrap();
+        let binary = temporary.path().join("tailscale");
+        write_fake_tailscale(
+            &binary,
+            &temporary.path().join("commands.log"),
+            r#"{"BackendState":"Running","Self":{"DNSName":"mac.example.ts.net."}}"#,
+            "{}",
+        );
+        mark_fake_dns_status_slow(&binary);
+
+        let target = Url::parse("http://127.0.0.1:49152").unwrap();
+        let started = std::time::Instant::now();
+        let error = ExposureSession::start(
+            ExposureProvider::TailscaleServe,
+            &target,
+            Some(&binary),
+            None,
+            443,
+        )
+        .await
+        .err()
+        .expect("stalled DNS diagnostics should be rejected");
+        assert!(started.elapsed() < Duration::from_secs(8));
+        assert!(error.to_string().contains("timed out after 5 seconds"));
+        assert!(!binary.with_extension("pid").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refuses_existing_configuration_without_starting_or_resetting_it() {
+        for (provider, mode) in [
+            (ExposureProvider::TailscaleServe, "Serve"),
+            (ExposureProvider::TailscaleFunnel, "Funnel"),
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let binary = temporary.path().join("tailscale");
+            let log = temporary.path().join("commands.log");
+            write_fake_tailscale(
+                &binary,
+                &log,
+                r#"{"BackendState":"Running","Self":{"DNSName":"mac.example.ts.net."}}"#,
+                r#"{"TCP":{"443":{}}}"#,
+            );
+            let target = Url::parse("http://127.0.0.1:49152").unwrap();
+            let error = ExposureSession::start(provider, &target, Some(&binary), None, 443)
+                .await
+                .err()
+                .expect("existing configuration should be refused");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "an existing Tailscale {mode} configuration is active; refusing to replace it"
+                )
+            );
+            let commands = std::fs::read_to_string(log).unwrap();
+            assert!(commands.contains(&format!("{} status --json", mode.to_lowercase())));
+            assert!(!commands.contains(" --yes "));
+            assert!(!commands.contains("reset"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reports_a_stopped_tailscale_backend() {
+        let temporary = tempfile::tempdir().unwrap();
+        let binary = temporary.path().join("tailscale");
+        let log = temporary.path().join("commands.log");
+        write_fake_tailscale(
+            &binary,
+            &log,
+            r#"{"BackendState":"Stopped","Self":{"DNSName":"mac.example.ts.net."}}"#,
+            "{}",
+        );
+        let target = Url::parse("http://127.0.0.1:49152").unwrap();
+        let error = ExposureSession::start(
+            ExposureProvider::TailscaleServe,
+            &target,
+            Some(&binary),
+            None,
+            443,
+        )
+        .await
+        .err()
+        .expect("stopped backend should be rejected");
+        assert_eq!(
+            error.to_string(),
+            "Tailscale is not ready: backend state is Stopped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reports_missing_tailscale_dns_name() {
+        let temporary = tempfile::tempdir().unwrap();
+        let binary = temporary.path().join("tailscale");
+        let log = temporary.path().join("commands.log");
+        write_fake_tailscale(
+            &binary,
+            &log,
+            r#"{"BackendState":"Running","Self":{}}"#,
+            "{}",
+        );
+        let target = Url::parse("http://127.0.0.1:49152").unwrap();
+        let error = ExposureSession::start(
+            ExposureProvider::TailscaleFunnel,
+            &target,
+            Some(&binary),
+            None,
+            443,
+        )
+        .await
+        .err()
+        .expect("missing DNS name should be rejected");
+        assert_eq!(
+            error.to_string(),
+            "Tailscale is not ready: the current node has no MagicDNS name"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reports_tailscale_cli_failures() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let binary = temporary.path().join("tailscale");
+        let log = temporary.path().join("commands.log");
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+if [ "$1" = "status" ]; then
+  printf '%s\n' 'tailscaled is unavailable' >&2
+  exit 1
+fi
+"#,
+            log.display()
+        );
+        std::fs::write(&binary, script).unwrap();
+        let mut permissions = std::fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&binary, permissions).unwrap();
+
+        let target = Url::parse("http://127.0.0.1:49152").unwrap();
+        let error = ExposureSession::start(
+            ExposureProvider::TailscaleServe,
+            &target,
+            Some(&binary),
+            None,
+            443,
+        )
+        .await
+        .err()
+        .expect("CLI failure should be returned");
+        assert_eq!(
+            error.to_string(),
+            "Tailscale failed: tailscaled is unavailable"
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_fake_tailscale(
+        binary: &std::path::Path,
+        log: &std::path::Path,
+        status_json: &str,
+        configuration_json: &str,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+if [ "$1" = "status" ]; then
+  printf '%s\n' '{}'
+elif [ "$1" = "dns" ] && [ "$2" = "status" ]; then
+  if [ -f "$0.dns-fail" ]; then
+    printf '%s\n' 'dns status is unavailable' >&2
+    exit 1
+  elif [ -f "$0.dns-slow" ]; then
+    sleep 6
+    printf '%s\n' '{{"TailscaleDNS":true,"CurrentTailnet":{{"MagicDNSEnabled":true,"SelfDNSName":"mac.example.ts.net."}}}}'
+  elif [ -f "$0.dns" ]; then
+    cat "$0.dns"
+  else
+    printf '%s\n' '{{"TailscaleDNS":true,"CurrentTailnet":{{"MagicDNSEnabled":true,"SelfDNSName":"mac.example.ts.net."}}}}'
+  fi
+elif [ "$2" = "status" ]; then
+  if [ -f "$0.config" ]; then
+    cat "$0.config"
+  else
+    printf '%s\n' '{}'
+  fi
+else
+  printf '%s\n' "$$" > "$0.pid"
+  port=${{3#--https=}}
+  public=false
+  if [ "$1" = "funnel" ]; then public=true; fi
+  printf '{{"Foreground":{{"test-session":{{"TCP":{{"%s":{{"HTTPS":true}}}},"Web":{{"mac.example.ts.net:%s":{{"Handlers":{{"/":{{"Proxy":"%s"}}}}}}}},"AllowFunnel":{{"mac.example.ts.net:%s":%s}}}}}}}}\n' "$port" "$port" "$4" "$port" "$public" > "$0.config"
+  printf '%s\n' 'Available; foreground session is running'
+  exec sleep 60
+fi
+"#,
+            log.display(),
+            status_json,
+            configuration_json
+        );
+        std::fs::write(binary, script).unwrap();
+        let mut permissions = std::fs::metadata(binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(binary, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn write_fake_dns_status(binary: &Path, status_json: &str) {
+        std::fs::write(binary.with_extension("dns"), status_json).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn mark_fake_dns_status_failed(binary: &Path) {
+        std::fs::write(binary.with_extension("dns-fail"), b"").unwrap();
+    }
+
+    #[cfg(unix)]
+    fn mark_fake_dns_status_slow(binary: &Path) {
+        std::fs::write(binary.with_extension("dns-slow"), b"").unwrap();
+    }
+
+    #[cfg(unix)]
+    fn assert_fake_child_exited(binary: &Path) {
+        let pid = std::fs::read_to_string(binary.with_extension("pid")).unwrap();
+        assert!(
+            !std::process::Command::new("kill")
+                .args(["-0", pid.trim()])
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[test]
+    fn readiness_requires_exact_foreground_https_proxy_and_scope() {
+        let target = Url::parse("http://127.0.0.1:49152/").unwrap();
+        let mut config = serde_json::json!({"Foreground":{"session":{
+            "TCP":{"443":{"HTTPS":true}},
+            "Web":{"mac.example.ts.net:443":{"Handlers":{"/":{"Proxy":target.as_str()}}}}
+        }}});
+        assert!(tailscale_configuration_ready(
+            &config,
+            TailscaleMode::Serve,
+            "mac.example.ts.net.",
+            443,
+            &target
+        ));
+        assert!(!tailscale_configuration_ready(
+            &config,
+            TailscaleMode::Funnel,
+            "mac.example.ts.net.",
+            443,
+            &target
+        ));
+        config["Foreground"]["session"]["AllowFunnel"] =
+            serde_json::json!({"mac.example.ts.net:443":true});
+        assert!(tailscale_configuration_ready(
+            &config,
+            TailscaleMode::Funnel,
+            "mac.example.ts.net.",
+            443,
+            &target
+        ));
+        assert!(!tailscale_configuration_ready(
+            &config,
+            TailscaleMode::Serve,
+            "mac.example.ts.net.",
+            443,
+            &target
+        ));
+        let other_target = Url::parse("http://127.0.0.1:49153/").unwrap();
+        assert!(!tailscale_configuration_ready(
+            &config,
+            TailscaleMode::Funnel,
+            "mac.example.ts.net.",
+            443,
+            &other_target
+        ));
+        assert!(!tailscale_configuration_ready(
+            &config,
+            TailscaleMode::Funnel,
+            "mac.example.ts.net.",
+            8443,
+            &target
+        ));
+        assert!(!tailscale_configuration_ready(
+            &config["Foreground"]["session"],
+            TailscaleMode::Funnel,
+            "mac.example.ts.net.",
+            443,
+            &target
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reports_foreground_exit_and_reaps_the_child() {
+        let temporary = tempfile::tempdir().unwrap();
+        let binary = temporary.path().join("tailscale");
+        write_fake_tailscale(
+            &binary,
+            &temporary.path().join("commands.log"),
+            r#"{"BackendState":"Running","Self":{"DNSName":"mac.example.ts.net."}}"#,
+            "{}",
+        );
+        let target = Url::parse("http://127.0.0.1:49152/").unwrap();
+        let mut session = ExposureSession::start(
+            ExposureProvider::TailscaleServe,
+            &target,
+            Some(&binary),
+            None,
+            443,
+        )
+        .await
+        .unwrap();
+        let ExposureSessionInner::Tailscale(inner) = &mut session.inner else {
+            panic!("Tailscale")
+        };
+        inner.child.start_kill().unwrap();
+        let error = session.wait_for_exit().await.unwrap_err();
+        assert!(matches!(error, ExposureError::TailscaleExited(_)));
+        session.stop().await.unwrap();
+        assert_fake_child_exited(&binary);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_cancellation_kills_the_child_waiting_for_setup() {
+        let temporary = tempfile::tempdir().unwrap();
+        let binary = temporary.path().join("tailscale");
+        write_fake_tailscale(
+            &binary,
+            &temporary.path().join("commands.log"),
+            r#"{"BackendState":"Running","Self":{"DNSName":"mac.example.ts.net."}}"#,
+            "{}",
+        );
+        // No foreground configuration appears while waiting for first-use setup.
+        let script = std::fs::read_to_string(&binary)
+            .unwrap()
+            .replace("if [ -f \"$0.config\" ]; then", "if false; then");
+        std::fs::write(&binary, script).unwrap();
+        let target = Url::parse("http://127.0.0.1:49152/").unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_millis(800),
+            ExposureSession::start(
+                ExposureProvider::TailscaleFunnel,
+                &target,
+                Some(&binary),
+                None,
+                443,
+            ),
+        )
+        .await;
+        assert!(result.is_err(), "should still be waiting for setup");
+        // Tokio reaps kill_on_drop children asynchronously.
+        sleep(Duration::from_millis(100)).await;
+        assert_fake_child_exited(&binary);
+    }
+
+    #[tokio::test]
+    async fn setup_diagnostics_are_consumed_before_the_stream_closes() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, reader) = tokio::io::duplex(256);
+        let logs = CapturedLogs::default();
+        let task = tailscale_log_task(reader, logs.clone());
+        writer
+            .write_all(b"To enable, visit: https://login.tailscale.com/f/funnel\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !logs
+                .snapshot()
+                .await
+                .contains("https://login.tailscale.com/f/funnel")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("setup URL must be read while CLI is still waiting");
+        assert!(!task.is_finished());
+        drop(writer);
+        task.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_foreground_start_reports_diagnostics_for_both_modes() {
+        for provider in [
+            ExposureProvider::TailscaleServe,
+            ExposureProvider::TailscaleFunnel,
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let binary = temporary.path().join("tailscale");
+            write_fake_tailscale(
+                &binary,
+                &temporary.path().join("commands.log"),
+                r#"{"BackendState":"Running","Self":{"DNSName":"mac.example.ts.net."}}"#,
+                "{}",
+            );
+            let script = std::fs::read_to_string(&binary)
+                .unwrap()
+                .replace("if [ -f \"$0.config\" ]; then", "if false; then")
+                .replace("exec sleep 60", "echo 'HTTPS setup denied' >&2\nexit 7");
+            std::fs::write(&binary, script).unwrap();
+            let target = Url::parse("http://127.0.0.1:49152/").unwrap();
+            let error = ExposureSession::start(provider, &target, Some(&binary), None, 443)
+                .await
+                .err()
+                .expect("failed child must not report ready");
+            assert!(error.to_string().contains("HTTPS setup denied"));
+            assert_fake_child_exited(&binary);
+        }
     }
 
     #[test]
