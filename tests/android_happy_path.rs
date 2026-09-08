@@ -69,15 +69,17 @@ async fn android_page_links_directly_to_the_described_apk() {
         Some("95f3fc3ee59a9d33792c2fb0b8bebd63836b312e30f03d8db5855bd98731a5b7")
     );
 
-    let manifest = client
-        .get(server.url(&format!(
-            "/api/v1/artifacts/{}/manifest.plist",
-            server.artifact.id
-        )))
-        .send()
-        .await
-        .expect("request inapplicable iOS manifest");
-    assert_eq!(manifest.status(), StatusCode::NOT_FOUND);
+    for query in ["", "?download=expired-page-grant"] {
+        let manifest = client
+            .get(server.url(&format!(
+                "/api/v1/artifacts/{}/manifest.plist{query}",
+                server.artifact.id
+            )))
+            .send()
+            .await
+            .expect("request inapplicable iOS manifest");
+        assert_eq!(manifest.status(), StatusCode::NOT_FOUND);
+    }
 }
 
 #[tokio::test]

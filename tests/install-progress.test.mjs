@@ -194,10 +194,11 @@ function createPage({ platform = "android" } = {}) {
   };
 }
 
-function installableState(phase, bytesSent, totalBytes = 1000) {
+function installableState(phase, bytesSent, totalBytes = 1000, bytesStreamed = bytesSent) {
   return {
     availability: "installable",
     bytes_sent: bytesSent,
+    bytes_streamed: bytesStreamed,
     total_bytes: totalBytes,
     phase,
   };
@@ -361,6 +362,28 @@ test("waiting and stalled transfers offer retry without inventing progress", asy
   assert.equal(isDisabled(stalledPage.action), false);
   assert.equal(stalledPage.elements.get("progress-bar").value, 10);
   assert.match(stalledPage.elements.get("progress-amount").textContent, /100 B/);
+});
+
+test("actively retransmitting a prefix stays live without inflating progress, then offers retry if it stalls", async () => {
+  const page = createPage();
+  page.setFetchResponse(jsonResponse(installableState("transferring", 900)));
+  await startAndPoll(page);
+
+  // A resumed full request can send the same prefix for longer than the stall
+  // timeout. Unique coverage stays at 90%, but the connection is still active.
+  page.setFetchResponse(jsonResponse(installableState("transferring", 900, 1000, 1200)));
+  await page.runNextTimer({ at: 21_000 });
+  assert.match(page.elements.get("progress-heading").textContent, /transferring package/i);
+  assert.equal(isDisabled(page.action), true);
+  assert.equal(page.elements.get("progress-bar").value, 90);
+  assert.match(page.elements.get("progress-amount").textContent, /900 B/);
+  assert.equal(click(page).defaultPrevented, true);
+
+  page.setFetchResponse(jsonResponse(installableState("transferring", 900, 1000, 1200)));
+  await page.runNextTimer({ at: 42_000 });
+  assert.match(page.elements.get("progress-heading").textContent, /waiting for transfer to continue/i);
+  assert.equal(isDisabled(page.action), false);
+  assert.equal(page.elements.get("progress-bar").value, 90);
 });
 
 test("repeated status failures end in a reload action, while a later network recovery completes", async () => {

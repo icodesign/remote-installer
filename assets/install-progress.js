@@ -22,7 +22,7 @@
   let request;
   let clickedAt = 0;
   let lastChangeAt = 0;
-  let lastBytes = 0;
+  let lastStreamedBytes = 0;
   let lastPhase = "waiting";
   let failures = 0;
 
@@ -57,13 +57,17 @@
     const now = Date.now();
     const total = state.total_bytes;
     const sent = state.bytes_sent;
+    const streamed = state.bytes_streamed;
     if (!Number.isSafeInteger(total) || total < 0 || !Number.isSafeInteger(sent) || sent < 0 ||
+        !Number.isSafeInteger(streamed) || streamed < sent ||
         sent > total || !["waiting", "preparing", "transferring", "interrupted", "transferred"].includes(state.phase) ||
         !["installable", "expired", "limit_reached"].includes(state.availability)) {
       throw new Error("Invalid transfer status");
     }
-    if (sent !== lastBytes || state.phase !== lastPhase) lastChangeAt = now;
-    lastBytes = sent;
+    // Retransmitting an already-covered prefix is activity even though the
+    // unique-byte percentage cannot advance until the retry catches up.
+    if (streamed !== lastStreamedBytes || state.phase !== lastPhase) lastChangeAt = now;
+    lastStreamedBytes = streamed;
     lastPhase = state.phase;
     const hasProgress = sent > 0 || state.phase === "transferring" || state.phase === "transferred";
     bar.hidden = amount.hidden = !hasProgress;

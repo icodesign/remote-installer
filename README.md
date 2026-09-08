@@ -92,6 +92,8 @@ On iOS, confirm **Install** in the system prompt. The page shows when the packag
 
 Progress measures bytes sent by the sharing computer for this page's download attempt. A tunnel may buffer data, so the displayed percentage can run ahead of the phone. **Package transfer complete does not mean installation succeeded.** Check the iPhone's Home Screen for the final installation result. Android users open the APK from their browser's downloads. The native install/download link also works with JavaScript disabled.
 
+Resumed transfers include bytes sent before an interruption. Retransmitting the same bytes keeps the transfer active without increasing the percentage twice. If an iOS page's progress session expires while the share is still available, its native install link can still start an installation; reload the page to track a new attempt.
+
 <img src="./assets/download.webp" width="200" height="417"/>
 
 ## For AI agents

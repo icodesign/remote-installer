@@ -80,6 +80,7 @@ async fn status_requires_its_grant_and_head_is_non_mutating_and_non_cacheable() 
     let initial = status(&client, &status_url).await;
     assert_eq!(initial["phase"], "waiting");
     assert_eq!(initial["bytes_sent"], 0);
+    assert_eq!(initial["bytes_streamed"], 0);
     assert_eq!(initial["total_bytes"], server.artifact_bytes.len() as u64);
     assert_eq!(initial["availability"], "installable");
 
@@ -195,6 +196,7 @@ async fn ios_manifest_reuses_the_page_grant_and_progress_deduplicates_resume_ran
     let resumed = status(&client, &first_status).await;
     assert_eq!(resumed["phase"], "transferring");
     assert_eq!(resumed["bytes_sent"], 24);
+    assert_eq!(resumed["bytes_streamed"], 32);
     assert_eq!(resumed["availability"], "installable");
 
     // A second page got a different grant and cannot observe this attempt.
@@ -212,6 +214,10 @@ async fn ios_manifest_reuses_the_page_grant_and_progress_deduplicates_resume_ran
     let final_status = status(&client, &first_status).await;
     assert_eq!(final_status["phase"], "transferred");
     assert_eq!(
+        final_status["bytes_streamed"],
+        server.artifact_bytes.len() as u64 + 32
+    );
+    assert_eq!(
         final_status["bytes_sent"],
         server.artifact_bytes.len() as u64
     );
@@ -224,4 +230,56 @@ async fn ios_manifest_reuses_the_page_grant_and_progress_deduplicates_resume_ran
     // The known grant remains readable after quota exhaustion, even though a
     // new package request would be rejected.
     assert_eq!(status(&client, &first_status).await, final_status);
+}
+
+#[tokio::test]
+async fn an_evicted_ios_page_still_installs_without_reviving_its_old_grant() {
+    let server = support::spawn_server(SpawnOptions {
+        share_config: ShareConfig {
+            max_downloads: Some(1),
+            ..ShareConfig::default()
+        },
+    })
+    .await;
+    let client = support::http_client();
+    let page_url = server.url(&format!("/install/{}", server.artifact.id));
+    let page = client
+        .get(&page_url)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let stale_status = server.url(&attribute(&page, "data-status-url"));
+    let stale_package = stale_status.replace("/status?", "/download.ipa?");
+    let stale_manifest = manifest_url(&install_action(&page));
+
+    // Ordinary later page loads can fill the bounded table before this
+    // device taps its original native install link, with JavaScript disabled.
+    for _ in 0..16 {
+        let response = client.get(&page_url).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().await.unwrap();
+    }
+    let response = client.get(&stale_manifest).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let fresh_package = package_url(&response.text().await.unwrap());
+    assert_ne!(fresh_package, stale_package);
+
+    for stale_url in [&stale_status, &stale_package] {
+        assert_eq!(
+            client.get(stale_url).send().await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    let response = client.get(fresh_package).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.bytes().await.unwrap(), server.artifact_bytes);
+
+    // The fallback must not create another attempt once the share is spent.
+    assert_eq!(
+        client.get(stale_manifest).send().await.unwrap().status(),
+        StatusCode::GONE
+    );
 }

@@ -179,6 +179,8 @@ impl DownloadPhase {
 pub struct DownloadProgressSnapshot {
     pub phase: DownloadPhase,
     pub bytes_sent: u64,
+    /// All emitted bytes, including overlapping retries, for transfer liveness.
+    pub bytes_streamed: u64,
     pub total_bytes: u64,
     pub availability: Availability,
 }
@@ -199,6 +201,7 @@ struct DownloadGrantStatus {
     sent_ranges: Vec<(u64, u64)>,
     phase: DownloadPhase,
     bytes_sent: u64,
+    bytes_streamed: u64,
     total_bytes: u64,
 }
 
@@ -212,6 +215,7 @@ impl DownloadGrantStatus {
             sent_ranges: Vec::new(),
             phase: DownloadPhase::Waiting,
             bytes_sent: 0,
+            bytes_streamed: 0,
             total_bytes,
         }
     }
@@ -269,6 +273,9 @@ impl DownloadPermit {
                 .status
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if status.phase == DownloadPhase::Transferred {
+                return;
+            }
             status.total_bytes = total;
             if status.phase == DownloadPhase::Waiting {
                 status.phase = DownloadPhase::Preparing;
@@ -278,9 +285,10 @@ impl DownloadPermit {
 
     /// Record package bytes as the response stream yields them. Coverage is
     /// merged immediately so a cancelled request still leaves honest resume
-    /// progress, while overlapping retries never inflate the total.
+    /// progress, while overlapping retries never inflate coverage. They do
+    /// advance the activity counter, even after display or quota completion.
     pub(crate) fn record_response_bytes(&mut self, count: u64) {
-        if !self.active || count == 0 {
+        if count == 0 {
             return;
         }
         let Some(grant) = self.grant.as_ref() else {
@@ -289,7 +297,12 @@ impl DownloadPermit {
         let Some(total) = self.total_length else {
             return;
         };
-        if total == 0 {
+        let mut status = grant
+            .status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        status.bytes_streamed = status.bytes_streamed.saturating_add(count);
+        if status.phase == DownloadPhase::Transferred || total == 0 {
             return;
         }
 
@@ -303,13 +316,6 @@ impl DownloadPermit {
             .saturating_add(count.saturating_sub(1))
             .min(total.saturating_sub(1));
 
-        let mut status = grant
-            .status
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if status.completed {
-            return;
-        }
         add_download_range(&mut status.sent_ranges, response_start, end);
         status.bytes_sent = covered_download_bytes(&status.sent_ranges).min(total);
         status.total_bytes = total;
@@ -330,7 +336,7 @@ impl DownloadPermit {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             // `DownloadProgress::drop` runs before this permit's `Drop`, so
             // one active request here means this was the last live stream.
-            if !status.completed && status.active_requests <= 1 {
+            if status.phase != DownloadPhase::Transferred && status.active_requests <= 1 {
                 status.phase = DownloadPhase::Interrupted;
             }
         }
@@ -378,6 +384,14 @@ impl DownloadPermit {
                     }
                     _ => false,
                 };
+                if self
+                    .total_length
+                    .is_some_and(|total| covers_entire_download(&status.sent_ranges, total))
+                {
+                    // A successful response finishes observed coverage, even
+                    // when an earlier cancelled prefix cannot satisfy quota.
+                    status.phase = DownloadPhase::Transferred;
+                }
                 let release = !complete && status.active_requests == 0 && status.reserved;
                 if complete {
                     status.completed = true;
@@ -419,7 +433,10 @@ impl Drop for DownloadPermit {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 status.active_requests = status.active_requests.saturating_sub(1);
-                if self.total_length.is_some() && status.active_requests == 0 && !status.completed {
+                if self.total_length.is_some()
+                    && status.active_requests == 0
+                    && status.phase != DownloadPhase::Transferred
+                {
                     status.phase = DownloadPhase::Interrupted;
                 }
                 if status.active_requests == 0 && !status.completed && status.reserved {
@@ -711,6 +728,7 @@ impl ShareService {
         Ok(DownloadProgressSnapshot {
             phase: status.phase,
             bytes_sent: status.bytes_sent,
+            bytes_streamed: status.bytes_streamed,
             total_bytes: status.total_bytes,
             availability: self.availability(),
         })
@@ -996,8 +1014,9 @@ impl ShareService {
     }
 
     /// Render an iOS manifest using a page-issued grant when supplied. The
-    /// grant remains optional for older bookmarked manifest URLs, which keep
-    /// their historical behavior of minting a new attempt.
+    /// grant remains optional for older bookmarked manifest URLs. An expired
+    /// page grant uses that same fresh-attempt fallback, so an idle page still
+    /// has a working native install link without JavaScript.
     pub async fn manifest_at_with_download_grant(
         &self,
         artifact: &Artifact,
@@ -1015,12 +1034,24 @@ impl ShareService {
                 // A valid grant must not keep a spent or expired share alive;
                 // package authorization below enforces the same rule again.
                 self.servable_artifact(&artifact.id)?;
-                if mark_preparing {
-                    self.prepare_download_grant(&artifact.id, grant).await?;
+                let validation = if mark_preparing {
+                    self.prepare_download_grant(&artifact.id, grant).await
                 } else {
-                    self.download_grant(&artifact.id, grant).await?;
+                    self.download_grant(&artifact.id, grant).await.map(|_| ())
+                };
+                match validation {
+                    Ok(()) => {
+                        self.artifact_download_url_for_grant_at(artifact, public_base_url, grant)
+                    }
+                    Err(ServiceError::Forbidden(_)) => {
+                        // The artifact's legacy manifest already permits a new
+                        // attempt. Replace this stale grant; never revive it for
+                        // the status or package routes that require its token.
+                        self.artifact_download_url_at(artifact, public_base_url)
+                            .await?
+                    }
+                    Err(error) => return Err(error),
                 }
-                self.artifact_download_url_for_grant_at(artifact, public_base_url, grant)
             }
             None => {
                 self.artifact_download_url_at(artifact, public_base_url)
@@ -1420,6 +1451,7 @@ mod tests {
             DownloadProgressSnapshot {
                 phase: DownloadPhase::Waiting,
                 bytes_sent: 0,
+                bytes_streamed: 0,
                 total_bytes: service.artifact().byte_count,
                 availability: Availability::Installable,
             }
@@ -1428,13 +1460,14 @@ mod tests {
         // Cancellation after bytes left the origin is visible to this grant,
         // but those incomplete bytes must not satisfy quota coverage.
         let mut cancelled = service.authorize_download(&id, Some(&grant)).await.unwrap();
-        cancelled.configure_response(Some((0, 9)), 20);
+        cancelled.configure_response(None, 20);
         cancelled.record_response_bytes(10);
         cancelled.interrupt_response();
         drop(cancelled);
         let cancelled_status = service.download_progress(&id, &grant).await.unwrap();
         assert_eq!(cancelled_status.phase, DownloadPhase::Interrupted);
         assert_eq!(cancelled_status.bytes_sent, 10);
+        assert_eq!(cancelled_status.bytes_streamed, 10);
         assert_eq!(service.quota.completed(), 0);
 
         // An overlapping retry contributes only its five new bytes (10..=14).
@@ -1445,18 +1478,50 @@ mod tests {
         let resuming = service.download_progress(&id, &grant).await.unwrap();
         assert_eq!(resuming.phase, DownloadPhase::Transferring);
         assert_eq!(resuming.bytes_sent, 15);
+        assert_eq!(resuming.bytes_streamed, 20);
         assert_eq!(service.quota.completed(), 0);
+
+        // Repeated bytes must still signal activity while unique coverage
+        // stays unchanged. Keep this stream open across the suffix response.
+        let mut duplicate = service.authorize_download(&id, Some(&grant)).await.unwrap();
+        duplicate.configure_response(None, 20);
+        duplicate.record_response_bytes(3);
+        let repeated = service.download_progress(&id, &grant).await.unwrap();
+        assert_eq!(repeated.bytes_sent, 15);
+        assert_eq!(repeated.bytes_streamed, 23);
 
         let mut finish = service.authorize_download(&id, Some(&grant)).await.unwrap();
         finish.configure_response(Some((15, 19)), 20);
         finish.record_response_bytes(5);
-        finish.complete_response();
-        // The UI has seen all bytes, including the cancelled prefix, but only
-        // fully delivered responses count toward the quota transfer.
         assert_eq!(
             service.download_progress(&id, &grant).await.unwrap().phase,
-            DownloadPhase::Transferring
+            DownloadPhase::Transferring,
+            "observed completion waits for a successful response"
         );
+        finish.complete_response();
+        // The resumed client has all bytes, including the cancelled prefix.
+        // Display completion is independent of successful-response quota coverage.
+        assert_eq!(
+            service.download_progress(&id, &grant).await.unwrap().phase,
+            DownloadPhase::Transferred
+        );
+        assert_eq!(service.quota.completed(), 0);
+        assert_eq!(service.availability(), Availability::Installable);
+
+        // Another overlapping retry cannot undo observed completion when it
+        // yields duplicate bytes or is cancelled before completing its body.
+        duplicate.record_response_bytes(1);
+        let repeated = service.download_progress(&id, &grant).await.unwrap();
+        assert_eq!(repeated.phase, DownloadPhase::Transferred);
+        assert_eq!(repeated.bytes_sent, 20);
+        assert_eq!(repeated.bytes_streamed, 29);
+        duplicate.interrupt_response();
+        drop(duplicate);
+        assert_eq!(
+            service.download_progress(&id, &grant).await.unwrap().phase,
+            DownloadPhase::Transferred
+        );
+        assert_eq!(service.quota.completed(), 0);
         let mut recover_prefix = service.authorize_download(&id, Some(&grant)).await.unwrap();
         recover_prefix.configure_response(Some((0, 4)), 20);
         recover_prefix.record_response_bytes(5);
@@ -1464,8 +1529,21 @@ mod tests {
         let completed = service.download_progress(&id, &grant).await.unwrap();
         assert_eq!(completed.phase, DownloadPhase::Transferred);
         assert_eq!(completed.bytes_sent, 20);
+        assert_eq!(completed.bytes_streamed, 34);
         assert_eq!(completed.total_bytes, 20);
         assert_eq!(completed.availability, Availability::LimitReached);
+        assert_eq!(service.quota.completed(), 1);
+
+        // Completed grants may serve retries without another quota charge;
+        // these streams still advance activity and retain display completion.
+        let mut completed_retry = service.authorize_download(&id, Some(&grant)).await.unwrap();
+        completed_retry.configure_response(None, 20);
+        completed_retry.record_response_bytes(2);
+        drop(completed_retry);
+        let retried = service.download_progress(&id, &grant).await.unwrap();
+        assert_eq!(retried.phase, DownloadPhase::Transferred);
+        assert_eq!(retried.bytes_sent, 20);
+        assert_eq!(retried.bytes_streamed, 36);
         assert_eq!(service.quota.completed(), 1);
 
         // Possession of one grant never exposes another attempt's state, even
@@ -1487,6 +1565,61 @@ mod tests {
             Err(ServiceError::Forbidden(_))
         ));
         assert_eq!(service.quota.completed(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_expired_page_grant_gets_a_fresh_manifest_without_reviving_the_old_token() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut service = make_service(temporary.path(), ShareConfig::default()).await;
+        let id = service.artifact().id.clone();
+        let expired = service.issue_download_grant(&id).await.unwrap();
+        service
+            .download_grants
+            .lock()
+            .await
+            .get_mut(&expired)
+            .unwrap()
+            .expires_at = Instant::now();
+
+        let manifest = service
+            .manifest_at_with_download_grant(
+                service.artifact(),
+                &service.public_base_urls()[0],
+                Some(&expired),
+                true,
+            )
+            .await
+            .expect("an idle page must retain its native iOS install action");
+        let fresh = manifest
+            .split("?download=")
+            .nth(1)
+            .unwrap()
+            .split("</string>")
+            .next()
+            .unwrap();
+        assert_ne!(fresh, expired);
+        assert!(service.authorize_download(&id, Some(fresh)).await.is_ok());
+        assert!(matches!(
+            service.authorize_download(&id, Some(&expired)).await,
+            Err(ServiceError::Forbidden(_))
+        ));
+        assert!(matches!(
+            service.download_progress(&id, &expired).await,
+            Err(ServiceError::Forbidden(_))
+        ));
+
+        service.expires_at = Some(Instant::now());
+        assert!(matches!(
+            service
+                .manifest_at_with_download_grant(
+                    service.artifact(),
+                    &service.public_base_urls()[0],
+                    Some(&expired),
+                    true,
+                )
+                .await,
+            Err(ServiceError::Gone(_))
+        ));
     }
 
     #[tokio::test]

@@ -293,6 +293,7 @@ impl HttpState {
             serde_json::json!({
                 "phase": progress.phase.as_str(),
                 "bytes_sent": progress.bytes_sent,
+                "bytes_streamed": progress.bytes_streamed,
                 "total_bytes": progress.total_bytes,
                 "availability": availability,
             }),
