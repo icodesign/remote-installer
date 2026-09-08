@@ -26,6 +26,7 @@ Remote Installer validates the build, opens a temporary HTTPS link, and prints a
 
 - Support for `.ipa`, signed device `.app`, and signed standalone `.apk` builds
 - Optional expiry and successful-download limits that continue to work across interrupted and resumed range requests
+- Immediate install feedback and live package transfer progress on the install page
 - Automatic provider discovery: starts every installed provider (Tailscale Serve, Tailscale Funnel, and Cloudflare Quick Tunnel)
 - Automatic cleanup when sharing ends
 
@@ -87,6 +88,10 @@ remote-installer share /path/to/MyApp.app
 2. Open the link in the phone browser or scan the QR code with the camera.
 3. Tap **Install**.
 
+On iOS, confirm **Install** in the system prompt. The page shows when the package transfer starts, its percentage and size, and whether it was interrupted. If no download starts, it offers retry guidance. Use Safari if the installation prompt does not appear.
+
+Progress measures bytes sent by the sharing computer for this page's download attempt. A tunnel may buffer data, so the displayed percentage can run ahead of the phone. **Package transfer complete does not mean installation succeeded.** Check the iPhone's Home Screen for the final installation result. Android users open the APK from their browser's downloads. The native install/download link also works with JavaScript disabled.
+
 <img src="./assets/download.webp" width="200" height="417"/>
 
 ## For AI agents
@@ -109,7 +114,7 @@ Example agent request:
 remote-installer share MyApp.ipa --max-downloads 1 --expire-after 1h
 ```
 
-The command exits when either limit is reached, after allowing an active download to finish.
+The command exits when either limit is reached, after allowing an active download to finish. After the successful-download limit is reached, it keeps transfer status available for five seconds before closing the tunnel. New download attempts are already blocked during that interval. If the share closes while the page is open, the page directs you to check your device instead of assuming installation failed.
 
 ### Useful options
 

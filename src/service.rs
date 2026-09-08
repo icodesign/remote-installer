@@ -151,12 +151,70 @@ struct DownloadGrantState {
     status: StdMutex<DownloadGrantStatus>,
 }
 
-#[derive(Debug, Default)]
+/// The package-transfer stage the install page can truthfully report. These
+/// stages describe bytes this origin has served; they intentionally do not
+/// claim anything about the device accepting or installing the package.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadPhase {
+    Waiting,
+    Preparing,
+    Transferring,
+    Interrupted,
+    Transferred,
+}
+
+impl DownloadPhase {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Waiting => "waiting",
+            Self::Preparing => "preparing",
+            Self::Transferring => "transferring",
+            Self::Interrupted => "interrupted",
+            Self::Transferred => "transferred",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DownloadProgressSnapshot {
+    pub phase: DownloadPhase,
+    pub bytes_sent: u64,
+    pub total_bytes: u64,
+    pub availability: Availability,
+}
+
+#[derive(Debug)]
 struct DownloadGrantStatus {
     active_requests: u64,
     completed: bool,
     reserved: bool,
+    /// Only complete HTTP responses contribute to quota completion. A partial
+    /// range that was cancelled must stay out of this set so the existing
+    /// max-downloads semantics remain unchanged.
     covered_ranges: Vec<(u64, u64)>,
+    /// Bytes actually yielded by response streams, including partial
+    /// cancelled responses. This is kept separately from quota coverage so
+    /// the UI can honestly show resume progress without charging a failed
+    /// response as a completed download.
+    sent_ranges: Vec<(u64, u64)>,
+    phase: DownloadPhase,
+    bytes_sent: u64,
+    total_bytes: u64,
+}
+
+impl DownloadGrantStatus {
+    fn waiting(total_bytes: u64) -> Self {
+        Self {
+            active_requests: 0,
+            completed: false,
+            reserved: false,
+            covered_ranges: Vec::new(),
+            sent_ranges: Vec::new(),
+            phase: DownloadPhase::Waiting,
+            bytes_sent: 0,
+            total_bytes,
+        }
+    }
 }
 
 /// A body-owned reservation for one direct download or one manifest grant.
@@ -168,6 +226,7 @@ pub(crate) struct DownloadPermit {
     active: bool,
     configured_range: Option<(u64, u64)>,
     total_length: Option<u64>,
+    response_bytes_sent: u64,
     finished: bool,
 }
 
@@ -179,6 +238,7 @@ impl DownloadPermit {
             active: true,
             configured_range: None,
             total_length: None,
+            response_bytes_sent: 0,
             finished: false,
         }
     }
@@ -190,6 +250,7 @@ impl DownloadPermit {
             active,
             configured_range: None,
             total_length: None,
+            response_bytes_sent: 0,
             finished: false,
         }
     }
@@ -200,6 +261,79 @@ impl DownloadPermit {
     pub(crate) fn configure_response(&mut self, range: Option<(u64, u64)>, total: u64) {
         self.configured_range = range;
         self.total_length = Some(total);
+        if !self.active {
+            return;
+        }
+        if let Some(grant) = self.grant.as_ref() {
+            let mut status = grant
+                .status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            status.total_bytes = total;
+            if status.phase == DownloadPhase::Waiting {
+                status.phase = DownloadPhase::Preparing;
+            }
+        }
+    }
+
+    /// Record package bytes as the response stream yields them. Coverage is
+    /// merged immediately so a cancelled request still leaves honest resume
+    /// progress, while overlapping retries never inflate the total.
+    pub(crate) fn record_response_bytes(&mut self, count: u64) {
+        if !self.active || count == 0 {
+            return;
+        }
+        let Some(grant) = self.grant.as_ref() else {
+            return;
+        };
+        let Some(total) = self.total_length else {
+            return;
+        };
+        if total == 0 {
+            return;
+        }
+
+        let start = self.configured_range.map_or(0, |(start, _)| start);
+        let response_start = start.saturating_add(self.response_bytes_sent);
+        self.response_bytes_sent = self.response_bytes_sent.saturating_add(count);
+        if response_start >= total {
+            return;
+        }
+        let end = response_start
+            .saturating_add(count.saturating_sub(1))
+            .min(total.saturating_sub(1));
+
+        let mut status = grant
+            .status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if status.completed {
+            return;
+        }
+        add_download_range(&mut status.sent_ranges, response_start, end);
+        status.bytes_sent = covered_download_bytes(&status.sent_ranges).min(total);
+        status.total_bytes = total;
+        status.phase = DownloadPhase::Transferring;
+    }
+
+    /// Mark a response that ended before its promised bytes were yielded. The
+    /// permit still releases the reservation from `Drop`; this records why the
+    /// next status poll did not reach a complete transfer.
+    pub(crate) fn interrupt_response(&mut self) {
+        if !self.active || self.finished {
+            return;
+        }
+        if let Some(grant) = self.grant.as_ref() {
+            let mut status = grant
+                .status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // `DownloadProgress::drop` runs before this permit's `Drop`, so
+            // one active request here means this was the last live stream.
+            if !status.completed && status.active_requests <= 1 {
+                status.phase = DownloadPhase::Interrupted;
+            }
+        }
     }
 
     /// Commit the reservation after the response body has delivered every
@@ -230,9 +364,16 @@ impl DownloadPermit {
                 (false, false)
             } else {
                 let complete = match (self.configured_range, self.total_length) {
-                    (None, Some(_)) => true,
+                    (None, Some(total)) => {
+                        add_download_range(&mut status.covered_ranges, 0, total.saturating_sub(1));
+                        add_download_range(&mut status.sent_ranges, 0, total.saturating_sub(1));
+                        status.bytes_sent = covered_download_bytes(&status.sent_ranges).min(total);
+                        covers_entire_download(&status.covered_ranges, total)
+                    }
                     (Some((start, end)), Some(total)) => {
                         add_download_range(&mut status.covered_ranges, start, end);
+                        add_download_range(&mut status.sent_ranges, start, end);
+                        status.bytes_sent = covered_download_bytes(&status.sent_ranges).min(total);
                         covers_entire_download(&status.covered_ranges, total)
                     }
                     _ => false,
@@ -241,6 +382,8 @@ impl DownloadPermit {
                 if complete {
                     status.completed = true;
                     status.reserved = false;
+                    status.bytes_sent = status.total_bytes;
+                    status.phase = DownloadPhase::Transferred;
                 } else if release {
                     // The response itself succeeded, but it was only one
                     // piece of a resumable transfer. Let another download
@@ -276,6 +419,9 @@ impl Drop for DownloadPermit {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 status.active_requests = status.active_requests.saturating_sub(1);
+                if self.total_length.is_some() && status.active_requests == 0 && !status.completed {
+                    status.phase = DownloadPhase::Interrupted;
+                }
                 if status.active_requests == 0 && !status.completed && status.reserved {
                     status.reserved = false;
                     true
@@ -316,6 +462,12 @@ fn covers_entire_download(ranges: &[(u64, u64)], total: u64) -> bool {
         || ranges
             .first()
             .is_some_and(|(start, end)| *start == 0 && end.saturating_add(1) >= total)
+}
+
+fn covered_download_bytes(ranges: &[(u64, u64)]) -> u64 {
+    ranges.iter().fold(0_u64, |covered, (start, end)| {
+        covered.saturating_add(end.saturating_sub(*start).saturating_add(1))
+    })
 }
 
 /// Runtime state for one `remote-installer share` session.
@@ -534,11 +686,74 @@ impl ShareService {
                 issued_at: now,
                 expires_at: now + DOWNLOAD_GRANT_TTL,
                 state: Arc::new(DownloadGrantState {
-                    status: StdMutex::new(DownloadGrantStatus::default()),
+                    status: StdMutex::new(DownloadGrantStatus::waiting(self.artifact.byte_count)),
                 }),
             },
         );
         Ok(token)
+    }
+
+    /// Return the state of one known install attempt. This deliberately does
+    /// not call `servable_artifact`: a browser must be able to read the final
+    /// transfer result after the only download slot was consumed or after the
+    /// share deadline elapsed.
+    pub async fn download_progress(
+        &self,
+        artifact_id: &str,
+        grant_token: &str,
+    ) -> Result<DownloadProgressSnapshot, ServiceError> {
+        self.match_id(artifact_id)?;
+        let grant = self.download_grant(artifact_id, grant_token).await?;
+        let status = grant
+            .status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(DownloadProgressSnapshot {
+            phase: status.phase,
+            bytes_sent: status.bytes_sent,
+            total_bytes: status.total_bytes,
+            availability: self.availability(),
+        })
+    }
+
+    /// A manifest is the hand-off point for an iOS attempt. Recording this
+    /// separately from streaming lets the page distinguish "Safari asked iOS
+    /// to fetch it" from bytes that have actually left this server.
+    pub async fn prepare_download_grant(
+        &self,
+        artifact_id: &str,
+        grant_token: &str,
+    ) -> Result<(), ServiceError> {
+        let grant = self.download_grant(artifact_id, grant_token).await?;
+        let mut status = grant
+            .status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if matches!(
+            status.phase,
+            DownloadPhase::Waiting | DownloadPhase::Interrupted
+        ) {
+            status.phase = DownloadPhase::Preparing;
+        }
+        Ok(())
+    }
+
+    /// Look up a bounded-lifetime grant after resolving the immutable session
+    /// artifact. Keeping this check in the service means status, manifest, and
+    /// package routes all have the same authorization boundary.
+    async fn download_grant(
+        &self,
+        artifact_id: &str,
+        grant_token: &str,
+    ) -> Result<Arc<DownloadGrantState>, ServiceError> {
+        self.match_id(artifact_id)?;
+        let mut grants = self.download_grants.lock().await;
+        let now = Instant::now();
+        grants.retain(|_, grant| grant.expires_at > now);
+        let grant = grants
+            .get(grant_token)
+            .ok_or_else(|| ServiceError::Forbidden("invalid download grant".into()))?;
+        Ok(Arc::clone(&grant.state))
     }
 
     /// Reserve a download slot. The returned permit must stay attached to the
@@ -564,16 +779,7 @@ impl ShareService {
         }
 
         let grant = if let Some(token) = grant_token {
-            let mut grants = self.download_grants.lock().await;
-            let now = Instant::now();
-            grants.retain(|_, grant| grant.expires_at > now);
-            Some(
-                grants
-                    .get(token)
-                    .ok_or_else(|| ServiceError::Forbidden("invalid download grant".into()))?
-                    .state
-                    .clone(),
-            )
+            Some(self.download_grant(artifact_id, token).await?)
         } else {
             None
         };
@@ -751,6 +957,31 @@ impl ShareService {
         }
     }
 
+    /// Mint one grant for the browser page and return both the platform action
+    /// and its same-origin status endpoint. The status path is intentionally
+    /// relative so it cannot be sent to a provider or third-party origin.
+    pub async fn install_attempt_urls_at(
+        &self,
+        artifact: &Artifact,
+        public_base_url: &Url,
+    ) -> Result<(String, String), ServiceError> {
+        let grant = self.issue_download_grant(&artifact.id).await?;
+        let status_url = format!("/api/v1/artifacts/{}/status?download={grant}", artifact.id);
+        let action_url = match artifact.platform() {
+            Platform::Ios => {
+                let manifest_url = format!(
+                    "{}?download={grant}",
+                    self.manifest_url_at(artifact, public_base_url)
+                );
+                ipa::itms_services_url(&manifest_url)
+            }
+            Platform::Android => {
+                self.artifact_download_url_for_grant_at(artifact, public_base_url, &grant)
+            }
+        };
+        Ok((action_url, status_url))
+    }
+
     pub async fn manifest(&self, artifact: &Artifact) -> Result<String, ServiceError> {
         self.manifest_at(artifact, &self.public_base_urls[0]).await
     }
@@ -760,14 +991,42 @@ impl ShareService {
         artifact: &Artifact,
         public_base_url: &Url,
     ) -> Result<String, ServiceError> {
+        self.manifest_at_with_download_grant(artifact, public_base_url, None, false)
+            .await
+    }
+
+    /// Render an iOS manifest using a page-issued grant when supplied. The
+    /// grant remains optional for older bookmarked manifest URLs, which keep
+    /// their historical behavior of minting a new attempt.
+    pub async fn manifest_at_with_download_grant(
+        &self,
+        artifact: &Artifact,
+        public_base_url: &Url,
+        grant_token: Option<&str>,
+        mark_preparing: bool,
+    ) -> Result<String, ServiceError> {
         let PlatformMetadata::Ios(metadata) = &artifact.platform_metadata else {
             return Err(ServiceError::NotFound(
                 "Android packages do not use an OTA manifest".into(),
             ));
         };
-        let download_url = self
-            .artifact_download_url_at(artifact, public_base_url)
-            .await?;
+        let download_url = match grant_token {
+            Some(grant) => {
+                // A valid grant must not keep a spent or expired share alive;
+                // package authorization below enforces the same rule again.
+                self.servable_artifact(&artifact.id)?;
+                if mark_preparing {
+                    self.prepare_download_grant(&artifact.id, grant).await?;
+                } else {
+                    self.download_grant(&artifact.id, grant).await?;
+                }
+                self.artifact_download_url_for_grant_at(artifact, public_base_url, grant)
+            }
+            None => {
+                self.artifact_download_url_at(artifact, public_base_url)
+                    .await?
+            }
+        };
         let icon_url = self.icon_url_at(artifact, public_base_url);
         // iOS renders the home-screen placeholder from these two assets while
         // the package downloads; without them the user stares at a grey tile.
@@ -782,6 +1041,25 @@ impl ShareService {
             artifact.title(),
             &assets,
         ))
+    }
+
+    fn artifact_download_url_for_grant_at(
+        &self,
+        artifact: &Artifact,
+        public_base_url: &Url,
+        grant: &str,
+    ) -> String {
+        format!(
+            "{}?download={grant}",
+            self.local_route_at(
+                public_base_url,
+                &format!(
+                    "/api/v1/artifacts/{}/download.{}",
+                    artifact.id,
+                    artifact.download_extension()
+                )
+            )
+        )
     }
 
     fn local_route_at(&self, public_base_url: &Url, path: &str) -> String {
@@ -1069,6 +1347,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_known_grants_progress_remains_readable_after_the_share_expires() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut service = make_service(temporary.path(), ShareConfig::default()).await;
+        let id = service.artifact().id.clone();
+        let grant = service.issue_download_grant(&id).await.unwrap();
+
+        // Make expiry deterministic without sleeping in this authorization
+        // test. The grant has its own bounded lifetime and status is allowed
+        // to report it after the share can no longer start new downloads.
+        service.expires_at = Some(Instant::now());
+        let progress = service.download_progress(&id, &grant).await.unwrap();
+        assert_eq!(progress.phase, DownloadPhase::Waiting);
+        assert_eq!(progress.availability, Availability::Expired);
+        assert!(matches!(
+            service.authorize_download(&id, Some(&grant)).await,
+            Err(ServiceError::Gone(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn a_grant_counts_only_after_its_full_transfer_is_complete() {
         let temporary = tempfile::tempdir().unwrap();
         let service = make_service(
@@ -1100,6 +1398,82 @@ mod tests {
             service.authorize_download(&id, None).await,
             Err(ServiceError::Gone(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn grant_progress_uses_yielded_bytes_without_changing_quota_coverage() {
+        let temporary = tempfile::tempdir().unwrap();
+        let service = make_service(
+            temporary.path(),
+            ShareConfig {
+                max_downloads: Some(1),
+                ..ShareConfig::default()
+            },
+        )
+        .await;
+        let id = service.artifact().id.clone();
+        let grant = service.issue_download_grant(&id).await.unwrap();
+        let other_grant = service.issue_download_grant(&id).await.unwrap();
+
+        assert_eq!(
+            service.download_progress(&id, &grant).await.unwrap(),
+            DownloadProgressSnapshot {
+                phase: DownloadPhase::Waiting,
+                bytes_sent: 0,
+                total_bytes: service.artifact().byte_count,
+                availability: Availability::Installable,
+            }
+        );
+
+        // Cancellation after bytes left the origin is visible to this grant,
+        // but those incomplete bytes must not satisfy quota coverage.
+        let mut cancelled = service.authorize_download(&id, Some(&grant)).await.unwrap();
+        cancelled.configure_response(Some((0, 9)), 20);
+        cancelled.record_response_bytes(10);
+        cancelled.interrupt_response();
+        drop(cancelled);
+        let cancelled_status = service.download_progress(&id, &grant).await.unwrap();
+        assert_eq!(cancelled_status.phase, DownloadPhase::Interrupted);
+        assert_eq!(cancelled_status.bytes_sent, 10);
+        assert_eq!(service.quota.completed(), 0);
+
+        // An overlapping retry contributes only its five new bytes (10..=14).
+        let mut overlap = service.authorize_download(&id, Some(&grant)).await.unwrap();
+        overlap.configure_response(Some((5, 14)), 20);
+        overlap.record_response_bytes(10);
+        overlap.complete_response();
+        let resuming = service.download_progress(&id, &grant).await.unwrap();
+        assert_eq!(resuming.phase, DownloadPhase::Transferring);
+        assert_eq!(resuming.bytes_sent, 15);
+        assert_eq!(service.quota.completed(), 0);
+
+        let mut finish = service.authorize_download(&id, Some(&grant)).await.unwrap();
+        finish.configure_response(Some((15, 19)), 20);
+        finish.record_response_bytes(5);
+        finish.complete_response();
+        // The UI has seen all bytes, including the cancelled prefix, but only
+        // fully delivered responses count toward the quota transfer.
+        assert_eq!(
+            service.download_progress(&id, &grant).await.unwrap().phase,
+            DownloadPhase::Transferring
+        );
+        let mut recover_prefix = service.authorize_download(&id, Some(&grant)).await.unwrap();
+        recover_prefix.configure_response(Some((0, 4)), 20);
+        recover_prefix.record_response_bytes(5);
+        recover_prefix.complete_response();
+        let completed = service.download_progress(&id, &grant).await.unwrap();
+        assert_eq!(completed.phase, DownloadPhase::Transferred);
+        assert_eq!(completed.bytes_sent, 20);
+        assert_eq!(completed.total_bytes, 20);
+        assert_eq!(completed.availability, Availability::LimitReached);
+        assert_eq!(service.quota.completed(), 1);
+
+        // Possession of one grant never exposes another attempt's state, even
+        // after the share has become unavailable for new downloads.
+        let untouched = service.download_progress(&id, &other_grant).await.unwrap();
+        assert_eq!(untouched.phase, DownloadPhase::Waiting);
+        assert_eq!(untouched.bytes_sent, 0);
+        assert_eq!(untouched.availability, Availability::LimitReached);
     }
 
     #[tokio::test]
@@ -1148,7 +1522,8 @@ mod tests {
         let service = make_service(temporary.path(), ShareConfig::default()).await;
         let id = service.artifact().id.clone();
 
-        let mut newest = String::new();
+        let oldest = service.issue_download_grant(&id).await.unwrap();
+        let mut newest = oldest.clone();
         for _ in 0..(MAX_DOWNLOAD_GRANTS * 8) {
             newest = service
                 .issue_download_grant(&id)
@@ -1163,6 +1538,25 @@ mod tests {
             .authorize_download(&id, Some(&newest))
             .await
             .expect("the most recent grant survives eviction");
+        assert!(matches!(
+            service.download_progress(&id, &oldest).await,
+            Err(ServiceError::Forbidden(_))
+        ));
+
+        // An expired grant is rejected by the same status lookup, even while
+        // the share itself remains installable.
+        let expiring = service.issue_download_grant(&id).await.unwrap();
+        service
+            .download_grants
+            .lock()
+            .await
+            .get_mut(&expiring)
+            .unwrap()
+            .expires_at = Instant::now();
+        assert!(matches!(
+            service.download_progress(&id, &expiring).await,
+            Err(ServiceError::Forbidden(_))
+        ));
     }
 
     #[tokio::test]

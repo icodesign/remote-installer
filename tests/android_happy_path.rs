@@ -20,6 +20,22 @@ fn apk_href(html: &str) -> String {
         .to_string()
 }
 
+fn status_href(html: &str) -> String {
+    html.split("data-status-url=\"")
+        .nth(1)
+        .and_then(|tail| tail.split_once('"').map(|(href, _)| href))
+        .expect("Android install page should contain a granted status URL")
+        .to_string()
+}
+
+fn download_grant(url: &str) -> String {
+    url::Url::parse(url)
+        .expect("parse granted URL")
+        .query_pairs()
+        .find_map(|(key, value)| (key == "download").then(|| value.into_owned()))
+        .expect("granted URL should carry download token")
+}
+
 #[tokio::test]
 async fn android_page_links_directly_to_the_described_apk() {
     let server = support::spawn_android_server(SpawnOptions::default()).await;
@@ -38,6 +54,9 @@ async fn android_page_links_directly_to_the_described_apk() {
     assert!(html.contains("Requires Android API 26 or later"));
     assert!(html.contains("allow installs from this browser"));
     assert!(!html.contains("itms-services://"));
+    let apk_url = apk_href(&html);
+    let status_url = server.url(&status_href(&html));
+    assert_eq!(download_grant(&apk_url), download_grant(&status_url));
 
     let PlatformMetadata::Android(metadata) = &server.artifact.platform_metadata else {
         panic!("fixture should produce an Android artifact");

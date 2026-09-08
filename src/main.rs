@@ -616,9 +616,20 @@ fn preparation_stage_label(stage: PreparationStage) -> &'static str {
 /// way out of a slow drain is SIGKILL, because tokio keeps consuming SIGINT
 /// once its handler is installed.
 async fn wait_for_shutdown(service: Arc<ShareService>) {
+    let automatic_shutdown = async {
+        let reason = service.wait_until_unavailable().await;
+        if reason == Availability::LimitReached {
+            // The page polls once per second. Keep the origin reachable briefly
+            // so the final allowed transfer can report completion before the
+            // tunnel closes. The quota is already spent during this grace period.
+            println!("\nDownload limit reached — keeping transfer status available for 5 seconds.");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        reason
+    };
     tokio::select! {
         _ = tokio::signal::ctrl_c() => println!("\nStopping..."),
-        reason = service.wait_until_unavailable() => {
+        reason = automatic_shutdown => {
             let cause = match reason {
                 Availability::Expired => "Share expired",
                 Availability::LimitReached => "Download limit reached",

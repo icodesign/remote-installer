@@ -2,8 +2,8 @@ use crate::model::{Artifact, Availability, PlatformMetadata, format_bytes};
 
 /// Render the public install page for an artifact.
 ///
-/// The install page intentionally contains no JavaScript or external assets:
-/// the only action is the platform install URL produced by the service.
+/// A same-origin script progressively enhances the native install link with
+/// per-attempt transfer feedback. The link still works without JavaScript.
 ///
 /// A share that can no longer install still renders the whole page, with the
 /// button replaced by the reason. Answering 410 instead would leave someone
@@ -14,6 +14,7 @@ pub fn render(
     install_action_url: &str,
     icon_url: Option<&str>,
     availability: Availability,
+    progress_url: Option<&str>,
 ) -> String {
     let display_name = html_escape(artifact.title());
     let (
@@ -39,7 +40,7 @@ pub fn render(
                 "Bundle ID",
                 html_escape(&metadata.bundle_identifier),
                 compatibility,
-                String::new(),
+                "<p class=\"install-guidance\">Open in Safari, tap Install, then confirm the system prompt. Check your Home Screen for the app.</p>".to_string(),
                 "IPA",
                 "Install",
                 format!("Install {display_name} on this iPhone or iPad"),
@@ -75,7 +76,7 @@ pub fn render(
     };
     let cta_markup = match availability {
         Availability::Installable => format!(
-            r#"<a class="install-cta" href="{install_action_url}" aria-label="{install_aria}">{cta_label}</a>"#
+            r#"<a id="install-action" class="install-cta" href="{install_action_url}" aria-label="{install_aria}">{cta_label}</a>"#
         ),
         Availability::LimitReached => notice_markup(
             "Download limit reached",
@@ -85,6 +86,26 @@ pub fn render(
             "Link expired",
             "This share link is no longer active. Ask for a new one.",
         ),
+    };
+    let progress_markup = if availability == Availability::Installable {
+        progress_url.map(|url| {
+            let platform = match artifact.platform_metadata {
+                PlatformMetadata::Ios(_) => "ios",
+                PlatformMetadata::Android(_) => "android",
+            };
+            format!(r#"<section id="install-progress" class="install-progress" data-status-url="{}" data-platform="{platform}" aria-label="Package transfer status" hidden>
+          <div role="status" aria-live="polite" aria-atomic="true">
+            <p id="progress-heading" class="progress-heading"></p>
+            <p id="progress-detail" class="progress-detail"></p>
+          </div>
+          <progress id="progress-bar" max="100" value="0" aria-label="Package transfer" hidden></progress>
+          <p id="progress-amount" class="progress-amount" hidden></p>
+          <p class="progress-note">Transfer progress may run ahead of your device. This page cannot confirm installation.</p>
+        </section>
+        <script src="/install-progress.js" defer></script>"#, html_escape(url))
+        }).unwrap_or_default()
+    } else {
+        String::new()
     };
 
     format!(
@@ -360,6 +381,40 @@ pub fn render(
       transform: scale(0.98);
     }}
 
+    .install-cta[aria-disabled="true"] {{ opacity: 0.65; cursor: progress; }}
+
+    .install-progress {{
+      margin-top: 16px;
+      padding: 16px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--surface-sunken);
+      overflow-wrap: anywhere;
+    }}
+
+    [hidden] {{ display: none !important; }}
+
+    .progress-heading {{ margin: 0; font-size: 15px; font-weight: 600; line-height: 1.4; }}
+    .progress-detail {{ margin: 6px 0 0; font-size: 13px; line-height: 1.5; }}
+    .progress-note {{ margin: 12px 0 0; color: var(--text-tertiary); font-size: 12px; line-height: 1.5; }}
+    .progress-amount {{ margin: 6px 0 0; font-family: var(--font-mono); font-size: 12px; line-height: 1.5; }}
+    #progress-bar {{
+      display: block;
+      width: 100%;
+      height: 6px;
+      margin-top: 14px;
+      overflow: hidden;
+      border: 0;
+      border-radius: 3px;
+      appearance: none;
+      -webkit-appearance: none;
+      background: var(--border);
+      accent-color: var(--text-primary);
+    }}
+    #progress-bar::-webkit-progress-bar {{ background: var(--border); border-radius: 3px; }}
+    #progress-bar::-webkit-progress-value {{ background: var(--text-primary); border-radius: 3px; }}
+    #progress-bar::-moz-progress-bar {{ background: var(--text-primary); border-radius: 3px; }}
+
     .install-notice {{
       display: flex;
       min-height: 48px;
@@ -493,6 +548,7 @@ pub fn render(
 
       <div class="install-cta-wrap">
         {cta_markup}
+        {progress_markup}
       </div>
     </article>
   </main>
@@ -612,6 +668,7 @@ mod tests {
             "itms-services://?action=download-manifest&url=https://example.test/m?a=\"x\"",
             None,
             Availability::Installable,
+            None,
         );
 
         assert!(html.contains("&lt;Console &amp; &quot;Preview&quot;&gt;"));
@@ -629,6 +686,7 @@ mod tests {
             "itms-services://?action=download-manifest&url=https://example.test/manifest.plist",
             Some("/api/v1/artifacts/artifact-1/icon.png?size=92&mode=\"fit\""),
             Availability::Installable,
+            None,
         );
 
         assert!(html.contains(
@@ -643,6 +701,7 @@ mod tests {
             "itms-services://example.test/install",
             None,
             Availability::Installable,
+            None,
         );
         assert!(without_icon.contains("install-icon-missing"));
         assert!(without_icon.contains("App icon unavailable"));
@@ -658,6 +717,7 @@ mod tests {
             "itms-services://example.test/install",
             None,
             Availability::Installable,
+            None,
         );
         assert!(html.contains("Requires iOS 16.0 or later"));
         assert!(html.contains("install-compatibility"));
@@ -672,6 +732,7 @@ mod tests {
             "itms-services://example.test/install",
             None,
             Availability::Installable,
+            None,
         );
         assert!(!html.contains("Requires iOS"));
         assert!(!html.contains(" or later"));
@@ -686,6 +747,7 @@ mod tests {
             "itms-services://example.test/install",
             None,
             Availability::Installable,
+            None,
         );
 
         assert!(html.contains("<html lang=\"en\">"));
@@ -734,6 +796,7 @@ mod tests {
             "https://example.test/api/v1/artifacts/artifact-1/download.apk?download=grant",
             None,
             Availability::Installable,
+            None,
         );
 
         assert!(html.contains("<title>Install Console · APK</title>"));
@@ -767,6 +830,7 @@ mod tests {
             "https://example.test/api/v1/artifacts/artifact-1/download.apk?download=grant",
             None,
             Availability::Installable,
+            None,
         );
 
         assert!(html.contains(">Package name</dt>"));
@@ -792,6 +856,7 @@ mod tests {
             "itms-services://?action=download-manifest&url=https://example.test/manifest.plist",
             None,
             Availability::Installable,
+            None,
         );
 
         assert!(html.contains("width: min(390px, 100%)"));
@@ -848,8 +913,33 @@ mod tests {
         assert!(html.contains(".install-cta:hover"));
         assert!(html.contains(".install-cta:active"));
         assert!(html.contains(".install-cta:focus-visible"));
-        assert!(html.contains("<a class=\"install-cta\" href=\"itms-services://"));
+        assert!(
+            html.contains("<a id=\"install-action\" class=\"install-cta\" href=\"itms-services://")
+        );
         assert!(html.contains("class=\"install-info\""));
+    }
+
+    #[test]
+    fn progress_is_optional_escaped_and_only_available_for_installable_pages() {
+        let progress_url = "/api/v1/artifacts/artifact-1/status?download=grant&x=\"<";
+        let html = render(
+            &artifact(),
+            "itms-services://example.test/install",
+            None,
+            Availability::Installable,
+            Some(progress_url),
+        );
+        assert!(html.contains("data-status-url=\"/api/v1/artifacts/artifact-1/status?download=grant&amp;x=&quot;&lt;\""));
+        assert!(html.contains("data-platform=\"ios\""));
+        assert!(html.contains("<script src=\"/install-progress.js\" defer></script>"));
+        assert!(html.contains("aria-live=\"polite\""));
+        assert!(html.contains("This page cannot confirm installation."));
+        assert!(!html.contains("onclick="));
+        for availability in [Availability::Expired, Availability::LimitReached] {
+            let html = render(&artifact(), "", None, availability, Some(progress_url));
+            assert!(!html.contains("<script"));
+            assert!(!html.contains("data-status-url="));
+        }
     }
 
     #[test]
@@ -863,6 +953,7 @@ mod tests {
                 "itms-services://example.test/install",
                 None,
                 availability,
+                None,
             );
             // The button is gone, but the page still identifies the build so
             // the reader can tell they are at the right link.
