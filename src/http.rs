@@ -67,8 +67,10 @@ pub enum HttpError {
 enum Resource {
     Manifest(String),
     Download { id: String, extension: String },
+    DownloadStatus(String),
     Icon(String),
     InstallPage(String),
+    InstallProgressScript,
 }
 
 /// GET and HEAD both resolve to the matched resource; `HttpState::handle`
@@ -92,6 +94,9 @@ fn route(method: &Method, path: &str) -> Route {
         ["api", "v1", "artifacts", id, "manifest.plist"] => {
             Some(Resource::Manifest((*id).to_string()))
         }
+        ["api", "v1", "artifacts", id, "status"] => {
+            Some(Resource::DownloadStatus((*id).to_string()))
+        }
         ["api", "v1", "artifacts", id, download]
             if matches!(*download, "download.ipa" | "download.apk") =>
         {
@@ -102,6 +107,7 @@ fn route(method: &Method, path: &str) -> Route {
         }
         ["api", "v1", "artifacts", id, "icon.png"] => Some(Resource::Icon((*id).to_string())),
         ["install", id] => Some(Resource::InstallPage((*id).to_string())),
+        ["install-progress.js"] => Some(Resource::InstallProgressScript),
         _ => None,
     };
     match resource {
@@ -123,10 +129,16 @@ impl HttpState {
         // (success or error), a HEAD request must end up with an empty body.
         let is_head = request.method() == Method::HEAD;
         let route = route(request.method(), request.uri().path());
-        let response = match self.dispatch(route, is_head, request, peer).await {
+        let is_download_status = matches!(&route, Route::Found(Resource::DownloadStatus(_)));
+        let mut response = match self.dispatch(route, is_head, request, peer).await {
             Ok(response) => response,
             Err(error) => error_response(error),
         };
+        // The opaque grant is a credential for one install attempt. Do not let
+        // an intermediary retain either a successful status or an auth error.
+        if is_download_status {
+            no_store(&mut response);
+        }
         Ok(if is_head {
             empty_body(response)
         } else {
@@ -150,10 +162,18 @@ impl HttpState {
                 let public_base_url = self
                     .service
                     .public_base_url_for_authority(request_authority(&request));
+                let grant_token = query_param(request.uri().query(), "download");
                 let mut response = text_response(
                     StatusCode::OK,
                     "application/xml; charset=utf-8",
-                    self.service.manifest_at(artifact, public_base_url).await?,
+                    self.service
+                        .manifest_at_with_download_grant(
+                            artifact,
+                            public_base_url,
+                            grant_token.as_deref(),
+                            !is_head,
+                        )
+                        .await?,
                 );
                 no_store(&mut response);
                 Ok(response)
@@ -161,8 +181,12 @@ impl HttpState {
             Route::Found(Resource::Download { id, extension }) => {
                 self.download(&id, &extension, is_head, request, peer).await
             }
+            Route::Found(Resource::DownloadStatus(id)) => self.download_status(&id, &request).await,
             Route::Found(Resource::Icon(id)) => self.icon_download(&id).await,
-            Route::Found(Resource::InstallPage(id)) => self.install_page(&id, &request).await,
+            Route::Found(Resource::InstallPage(id)) => {
+                self.install_page(&id, &request, is_head).await
+            }
+            Route::Found(Resource::InstallProgressScript) => Ok(install_progress_script_response()),
             Route::MethodNotAllowed => Ok(method_not_allowed_response()),
             Route::NotFound => Ok(json_response(
                 StatusCode::NOT_FOUND,
@@ -248,35 +272,77 @@ impl HttpState {
         image_response(path).await
     }
 
+    async fn download_status(
+        &self,
+        artifact_id: &str,
+        request: &Request<Incoming>,
+    ) -> Result<Response<ResponseBody>, HttpError> {
+        let grant_token = query_param(request.uri().query(), "download")
+            .ok_or_else(|| ServiceError::Forbidden("missing download grant".into()))?;
+        let progress = self
+            .service
+            .download_progress(artifact_id, &grant_token)
+            .await?;
+        let availability = match progress.availability {
+            crate::model::Availability::Installable => "installable",
+            crate::model::Availability::Expired => "expired",
+            crate::model::Availability::LimitReached => "limit_reached",
+        };
+        let mut response = json_response(
+            StatusCode::OK,
+            serde_json::json!({
+                "phase": progress.phase.as_str(),
+                "bytes_sent": progress.bytes_sent,
+                "bytes_streamed": progress.bytes_streamed,
+                "total_bytes": progress.total_bytes,
+                "availability": availability,
+            }),
+        );
+        no_store(&mut response);
+        Ok(response)
+    }
+
     async fn install_page(
         &self,
         artifact_id: &str,
         request: &Request<Incoming>,
+        is_head: bool,
     ) -> Result<Response<ResponseBody>, HttpError> {
         let artifact = self.service.viewable_artifact(artifact_id)?;
         let public_base_url = self
             .service
             .public_base_url_for_authority(request_authority(request));
-        let install_action_url = match self.service.availability() {
+        let availability = self.service.availability();
+        let (install_action_url, progress_url) = match availability {
             crate::model::Availability::Installable => {
-                self.service
-                    .install_action_url_at(artifact, public_base_url)
-                    .await?
+                if is_head {
+                    // HEAD probes must not create an install attempt. Its body
+                    // is discarded below, so an empty action has no client
+                    // effect and avoids evicting a real device's grant.
+                    (String::new(), None)
+                } else {
+                    let (action, status) = self
+                        .service
+                        .install_attempt_urls_at(artifact, public_base_url)
+                        .await?;
+                    (action, Some(status))
+                }
             }
-            _ => String::new(),
+            _ => (String::new(), None),
         };
         let icon_url = self.service.icon_url_at(artifact, public_base_url);
         let html = install_page::render(
             artifact,
             &install_action_url,
             icon_url.as_deref(),
-            self.service.availability(),
+            availability,
+            progress_url.as_deref(),
         );
         let mut response = text_response(StatusCode::OK, "text/html; charset=utf-8", html);
         response.headers_mut().insert(
             "content-security-policy",
             HeaderValue::from_static(
-                "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+                "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; script-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
             ),
         );
         response
@@ -735,6 +801,9 @@ impl DownloadProgress {
     /// Record bytes handed to the client, returning the line to print, if any.
     fn record(&mut self, count: u64, now: Instant) -> Option<String> {
         self.sent = self.sent.saturating_add(count);
+        if let Some(permit) = self.permit.as_mut() {
+            permit.record_response_bytes(count);
+        }
         if self.expected > 0 && self.sent >= self.expected && !self.finished {
             self.finished = true;
             if let Some(permit) = self.permit.as_mut() {
@@ -793,6 +862,9 @@ impl Drop for DownloadProgress {
     fn drop(&mut self) {
         if let Some(line) = self.interrupted() {
             println!("{line}");
+            if let Some(permit) = self.permit.as_mut() {
+                permit.interrupt_response();
+            }
         }
     }
 }
@@ -931,6 +1003,20 @@ async fn image_response(path: PathBuf) -> Result<Response<ResponseBody>, HttpErr
         HeaderValue::from_static("public, max-age=3600, immutable"),
     );
     Ok(response)
+}
+
+fn install_progress_script_response() -> Response<ResponseBody> {
+    let mut response = text_response(
+        StatusCode::OK,
+        "application/javascript; charset=utf-8",
+        include_str!("../assets/install-progress.js").to_string(),
+    );
+    response.headers_mut().insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    no_store(&mut response);
+    response
 }
 
 fn no_store(response: &mut Response<ResponseBody>) {
@@ -1210,6 +1296,14 @@ mod tests {
             route(&Method::GET, "/api/v1/artifacts/artifact-1/manifest.plist"),
             Route::Found(Resource::Manifest(_))
         ));
+        assert!(matches!(
+            route(&Method::GET, "/api/v1/artifacts/artifact-1/status"),
+            Route::Found(Resource::DownloadStatus(_))
+        ));
+        assert!(matches!(
+            route(&Method::GET, "/install-progress.js"),
+            Route::Found(Resource::InstallProgressScript)
+        ));
 
         assert!(matches!(route(&Method::GET, "/healthz"), Route::NotFound));
         assert!(matches!(
@@ -1226,6 +1320,8 @@ mod tests {
             "/api/v1/artifacts/artifact-1/download.ipa",
             "/api/v1/artifacts/artifact-1/download.apk",
             "/api/v1/artifacts/artifact-1/manifest.plist",
+            "/api/v1/artifacts/artifact-1/status",
+            "/install-progress.js",
         ] {
             assert!(
                 matches!(route(&Method::HEAD, path), Route::Found(_)),
@@ -1399,5 +1495,19 @@ mod tests {
         assert_eq!(reported.headers()[CONTENT_LENGTH], "10");
         let body = reported.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body.as_ref(), b"0123456789");
+    }
+
+    #[tokio::test]
+    async fn install_progress_script_is_same_origin_non_cacheable_javascript() {
+        let response = install_progress_script_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[CONTENT_TYPE],
+            "application/javascript; charset=utf-8"
+        );
+        assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(!body.is_empty());
     }
 }

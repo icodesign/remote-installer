@@ -33,7 +33,7 @@ async fn install_page_serves_secure_html_with_the_itms_link() {
     assert!(content_type.starts_with("text/html"), "{content_type}");
     assert_eq!(
         response.headers().get("content-security-policy").unwrap(),
-        "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+        "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; script-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
     );
     assert_eq!(
         response.headers().get("referrer-policy").unwrap(),

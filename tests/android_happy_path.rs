@@ -20,6 +20,22 @@ fn apk_href(html: &str) -> String {
         .to_string()
 }
 
+fn status_href(html: &str) -> String {
+    html.split("data-status-url=\"")
+        .nth(1)
+        .and_then(|tail| tail.split_once('"').map(|(href, _)| href))
+        .expect("Android install page should contain a granted status URL")
+        .to_string()
+}
+
+fn download_grant(url: &str) -> String {
+    url::Url::parse(url)
+        .expect("parse granted URL")
+        .query_pairs()
+        .find_map(|(key, value)| (key == "download").then(|| value.into_owned()))
+        .expect("granted URL should carry download token")
+}
+
 #[tokio::test]
 async fn android_page_links_directly_to_the_described_apk() {
     let server = support::spawn_android_server(SpawnOptions::default()).await;
@@ -38,6 +54,9 @@ async fn android_page_links_directly_to_the_described_apk() {
     assert!(html.contains("Requires Android API 26 or later"));
     assert!(html.contains("allow installs from this browser"));
     assert!(!html.contains("itms-services://"));
+    let apk_url = apk_href(&html);
+    let status_url = server.url(&status_href(&html));
+    assert_eq!(download_grant(&apk_url), download_grant(&status_url));
 
     let PlatformMetadata::Android(metadata) = &server.artifact.platform_metadata else {
         panic!("fixture should produce an Android artifact");
@@ -50,15 +69,17 @@ async fn android_page_links_directly_to_the_described_apk() {
         Some("95f3fc3ee59a9d33792c2fb0b8bebd63836b312e30f03d8db5855bd98731a5b7")
     );
 
-    let manifest = client
-        .get(server.url(&format!(
-            "/api/v1/artifacts/{}/manifest.plist",
-            server.artifact.id
-        )))
-        .send()
-        .await
-        .expect("request inapplicable iOS manifest");
-    assert_eq!(manifest.status(), StatusCode::NOT_FOUND);
+    for query in ["", "?download=expired-page-grant"] {
+        let manifest = client
+            .get(server.url(&format!(
+                "/api/v1/artifacts/{}/manifest.plist{query}",
+                server.artifact.id
+            )))
+            .send()
+            .await
+            .expect("request inapplicable iOS manifest");
+        assert_eq!(manifest.status(), StatusCode::NOT_FOUND);
+    }
 }
 
 #[tokio::test]

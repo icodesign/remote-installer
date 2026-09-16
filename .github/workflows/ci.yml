@@ -47,6 +47,8 @@ jobs:
       - name: Check JavaScript packaging scripts
         run: |
           set -euo pipefail
+          node --check assets/install-progress.js
+          node --test tests/install-progress.test.mjs
           node --check packaging/npm/bin/remote-installer.js
           node --check packaging/npm/build-package.mjs
           node -e 'JSON.parse(require("fs").readFileSync("packaging/npm/package.json.template", "utf8"))'
