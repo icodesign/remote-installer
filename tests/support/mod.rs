@@ -65,15 +65,40 @@ impl Drop for SpawnedServer {
 /// `SpawnOptions`; everything else (temporary workspace, local repository,
 /// fixture IPA) is identical across tests so failures are easy to compare.
 pub async fn spawn_server(options: SpawnOptions) -> SpawnedServer {
-    let state_dir = tempfile::tempdir().expect("create temp state dir");
+    let (listener, base_url) = bind_loopback().await;
+    spawn_prepared_server(
+        listener,
+        base_url.clone(),
+        vec![Url::parse(&base_url).expect("parse public base url")],
+        options.share_config,
+    )
+    .await
+}
 
+/// Like `spawn_server`, but generated install URLs use these provider origins
+/// instead of the loopback listener. The origin still binds locally; tests
+/// send a Host header to select which advertised URL appears in the response.
+pub async fn spawn_server_with_public_base_urls(public_base_urls: Vec<Url>) -> SpawnedServer {
+    let (listener, base_url) = bind_loopback().await;
+    spawn_prepared_server(listener, base_url, public_base_urls, ShareConfig::default()).await
+}
+
+async fn bind_loopback() -> (TcpListener, String) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind loopback listener");
     let local_addr: SocketAddr = listener.local_addr().expect("listener local address");
     let base_url = format!("http://127.0.0.1:{}", local_addr.port());
-    let public_base_url = Url::parse(&base_url).expect("parse public base url");
+    (listener, base_url)
+}
 
+async fn spawn_prepared_server(
+    listener: TcpListener,
+    base_url: String,
+    public_base_urls: Vec<Url>,
+    share_config: ShareConfig,
+) -> SpawnedServer {
+    let state_dir = tempfile::tempdir().expect("create temp state dir");
     let fixture_path = state_dir.path().join("Example.ipa");
     let artifact_bytes = fixtures::write_example_ipa(&fixture_path);
     let prepared = artifact_input::prepare(
@@ -83,11 +108,11 @@ pub async fn spawn_server(options: SpawnOptions) -> SpawnedServer {
         artifact_input::SigningPolicy::Trusted,
     )
     .expect("prepare fixture IPA");
-    let service = ShareService::create(
+    let service = ShareService::create_with_public_base_urls(
         state_dir.path().join("workspace"),
-        public_base_url,
+        public_base_urls,
         &prepared,
-        options.share_config,
+        share_config,
     )
     .await
     .expect("construct ShareService");

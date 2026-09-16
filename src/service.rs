@@ -1104,6 +1104,14 @@ fn far_future() -> Instant {
     Instant::now() + Duration::from_secs(60 * 60 * 24 * 365)
 }
 
+/// Compare an incoming Host / `:authority` against a configured public origin.
+///
+/// The Host header does not carry a scheme. Parsing it as `http://` and then
+/// using `port_or_known_default()` treats a missing port as 80, so an HTTPS
+/// origin on 443 (`https://app.trycloudflare.com/`) would never match Host
+/// `app.trycloudflare.com`. Every Quick Tunnel request then fell back to the
+/// first origin — typically Tailscale. A Host without a port means the client
+/// used the scheme default (80 or 443); an explicit port must match the origin.
 fn authority_matches(base: &Url, authority: &str) -> bool {
     let Ok(candidate) = Url::parse(&format!("http://{authority}/")) else {
         return false;
@@ -1117,9 +1125,10 @@ fn authority_matches(base: &Url, authority: &str) -> bool {
     if !base_host.eq_ignore_ascii_case(candidate_host) {
         return false;
     }
-    let base_port = base.port_or_known_default();
-    let candidate_port = candidate.port_or_known_default();
-    base_port == candidate_port
+    match candidate.port() {
+        Some(port) => base.port_or_known_default() == Some(port),
+        None => matches!(base.port_or_known_default(), Some(80 | 443)),
+    }
 }
 
 #[cfg(test)]
@@ -1222,8 +1231,9 @@ mod tests {
             temporary.path(),
             ShareConfig::default(),
             vec![
-                Url::parse("https://tailnet.example.test").unwrap(),
-                Url::parse("https://public.example.test:8443").unwrap(),
+                Url::parse("https://mbp.example.ts.net").unwrap(),
+                Url::parse("https://mbp.example.ts.net:8443").unwrap(),
+                Url::parse("https://random-words.trycloudflare.com").unwrap(),
             ],
         )
         .await;
@@ -1231,29 +1241,80 @@ mod tests {
 
         assert_eq!(
             service
-                .public_base_url_for_authority(Some("public.example.test:8443"))
+                .public_base_url_for_authority(Some("mbp.example.ts.net"))
                 .as_str(),
-            "https://public.example.test:8443/"
+            "https://mbp.example.ts.net/"
         );
         assert_eq!(
             service
-                .public_base_url_for_authority(Some("PUBLIC.EXAMPLE.TEST:8443"))
+                .public_base_url_for_authority(Some("mbp.example.ts.net:8443"))
                 .as_str(),
-            "https://public.example.test:8443/"
+            "https://mbp.example.ts.net:8443/"
+        );
+        assert_eq!(
+            service
+                .public_base_url_for_authority(Some("random-words.trycloudflare.com"))
+                .as_str(),
+            "https://random-words.trycloudflare.com/"
+        );
+        assert_eq!(
+            service
+                .public_base_url_for_authority(Some("RANDOM-WORDS.TRYCLOUDFLARE.COM"))
+                .as_str(),
+            "https://random-words.trycloudflare.com/"
+        );
+        assert_eq!(
+            service
+                .public_base_url_for_authority(Some("random-words.trycloudflare.com:443"))
+                .as_str(),
+            "https://random-words.trycloudflare.com/"
         );
         assert_eq!(
             service.install_page_url_at(
                 &artifact,
-                service.public_base_url_for_authority(Some("public.example.test:8443"))
+                service.public_base_url_for_authority(Some("random-words.trycloudflare.com"))
             ),
-            format!("https://public.example.test:8443/install/{}", artifact.id)
+            format!(
+                "https://random-words.trycloudflare.com/install/{}",
+                artifact.id
+            )
         );
         assert_eq!(
             service
                 .public_base_url_for_authority(Some("unknown.example.test"))
                 .as_str(),
-            "https://tailnet.example.test/"
+            "https://mbp.example.ts.net/"
         );
+    }
+
+    #[test]
+    fn host_without_a_port_matches_https_origins_on_443() {
+        let cloudflare = Url::parse("https://random-words.trycloudflare.com/").unwrap();
+        let tailscale = Url::parse("https://mbp.example.ts.net/").unwrap();
+        let funnel = Url::parse("https://mbp.example.ts.net:8443/").unwrap();
+        let loopback = Url::parse("http://127.0.0.1:54321/").unwrap();
+
+        assert!(authority_matches(
+            &cloudflare,
+            "random-words.trycloudflare.com"
+        ));
+        assert!(authority_matches(
+            &cloudflare,
+            "RANDOM-WORDS.TRYCLOUDFLARE.COM"
+        ));
+        assert!(authority_matches(
+            &cloudflare,
+            "random-words.trycloudflare.com:443"
+        ));
+        assert!(!authority_matches(&cloudflare, "mbp.example.ts.net"));
+
+        assert!(authority_matches(&tailscale, "mbp.example.ts.net"));
+        assert!(authority_matches(&funnel, "mbp.example.ts.net:8443"));
+        assert!(!authority_matches(&funnel, "mbp.example.ts.net"));
+        assert!(!authority_matches(&funnel, "mbp.example.ts.net:443"));
+
+        assert!(authority_matches(&loopback, "127.0.0.1:54321"));
+        assert!(!authority_matches(&loopback, "127.0.0.1"));
     }
 
     #[tokio::test]

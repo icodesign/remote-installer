@@ -366,6 +366,12 @@ fn request_authority<B>(request: &Request<B>) -> Option<&str> {
         .and_then(|value| value.split(',').next())
         .map(str::trim)
         .filter(|value| !value.is_empty())
+        .or_else(|| {
+            request
+                .uri()
+                .authority()
+                .map(|authority| authority.as_str())
+        })
 }
 
 /// Run the loopback origin used by one share session until the caller's
@@ -1272,6 +1278,39 @@ mod tests {
         assert_eq!(head.headers()[CONTENT_TYPE], content_type);
         let body = head.into_body().collect().await.unwrap().to_bytes();
         assert!(body.is_empty());
+    }
+
+    #[test]
+    fn request_authority_prefers_forwarded_host_then_host_then_uri() {
+        let forwarded = Request::builder()
+            .header("x-forwarded-host", "forwarded.example.test")
+            .header(HOST, "host.example.test")
+            .uri("https://uri.example.test/install/artifact-1")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            request_authority(&forwarded),
+            Some("forwarded.example.test")
+        );
+
+        let host = Request::builder()
+            .header(HOST, "host.example.test")
+            .uri("https://uri.example.test/install/artifact-1")
+            .body(())
+            .unwrap();
+        assert_eq!(request_authority(&host), Some("host.example.test"));
+
+        let uri = Request::builder()
+            .uri("https://uri.example.test/install/artifact-1")
+            .body(())
+            .unwrap();
+        assert_eq!(request_authority(&uri), Some("uri.example.test"));
+
+        let empty = Request::builder()
+            .uri("/install/artifact-1")
+            .body(())
+            .unwrap();
+        assert_eq!(request_authority(&empty), None);
     }
 
     #[test]
