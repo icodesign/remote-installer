@@ -108,6 +108,10 @@ Example agent request:
 
 > Create a new build with latest changes for my iPhone, and give me the install URL with remote-installer.
 
+Or you can simply ask your agent to do everything for you:
+
+> Install skills from https://github.com/icodesign/remote-installer and create a new build ......
+
 ## Common recipes
 
 ### One person, one hour
