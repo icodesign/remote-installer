@@ -867,13 +867,13 @@ fn cloudflare_public_url(hostname: &str) -> Result<Url, ExposureError> {
 }
 
 fn cloudflared_arguments(metrics_address: &str, target: &Url) -> Vec<String> {
+    // Let cloudflared choose its transport. Its default auto mode prefers QUIC and
+    // can fall back to HTTP/2; pinning HTTP/2 breaks networks that only allow QUIC.
     [
         "tunnel",
         "--no-autoupdate",
         "--metrics",
         metrics_address,
-        "--protocol",
-        "http2",
         "--url",
         target.as_str(),
     ]
@@ -955,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn cloudflare_quick_tunnel_uses_http2() {
+    fn cloudflare_quick_tunnel_lets_cloudflared_select_transport() {
         let target = Url::parse("http://127.0.0.1:49152").unwrap();
         assert_eq!(
             cloudflared_arguments("127.0.0.1:49153", &target),
@@ -964,8 +964,6 @@ mod tests {
                 "--no-autoupdate",
                 "--metrics",
                 "127.0.0.1:49153",
-                "--protocol",
-                "http2",
                 "--url",
                 "http://127.0.0.1:49152/",
             ]
