@@ -6,8 +6,9 @@
 mod support;
 
 use reqwest::StatusCode;
-use reqwest::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE};
+use reqwest::header::{ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, HOST};
 use sha2::{Digest, Sha256};
+use url::Url;
 
 use support::SpawnOptions;
 
@@ -87,6 +88,83 @@ async fn manifest_advertises_the_icon_assets() {
     assert!(body.contains("software-package"), "{body}");
     assert!(body.contains("display-image"), "{body}");
     assert!(body.contains("full-size-image"), "{body}");
+}
+
+#[tokio::test]
+async fn each_provider_origin_keeps_its_own_install_urls() {
+    let tailscale = "https://mbp.example.ts.net";
+    let cloudflare = "https://random-words.trycloudflare.com";
+    let server = support::spawn_server_with_public_base_urls(vec![
+        Url::parse(tailscale).unwrap(),
+        Url::parse(cloudflare).unwrap(),
+    ])
+    .await;
+    let client = support::http_client();
+    let artifact_id = &server.artifact.id;
+
+    let manifest = client
+        .get(server.url(&format!("/api/v1/artifacts/{artifact_id}/manifest.plist")))
+        .header(HOST, "random-words.trycloudflare.com")
+        .send()
+        .await
+        .expect("request cloudflare manifest")
+        .text()
+        .await
+        .expect("read cloudflare manifest");
+    assert!(
+        manifest.contains(&format!(
+            "{cloudflare}/api/v1/artifacts/{artifact_id}/download.ipa"
+        )),
+        "quick-tunnel manifest must advertise its own IPA URL, got {manifest}"
+    );
+    assert!(
+        manifest.contains(&format!(
+            "{cloudflare}/api/v1/artifacts/{artifact_id}/icon.png"
+        )),
+        "quick-tunnel manifest must advertise its own icon URL, got {manifest}"
+    );
+    assert!(
+        !manifest.contains("example.ts.net"),
+        "quick-tunnel manifest must not reuse the Tailscale origin, got {manifest}"
+    );
+
+    let install_page = client
+        .get(server.url(&format!("/install/{artifact_id}")))
+        .header(HOST, "random-words.trycloudflare.com")
+        .send()
+        .await
+        .expect("request cloudflare install page")
+        .text()
+        .await
+        .expect("read cloudflare install page");
+    assert!(
+        install_page.contains("random-words.trycloudflare.com"),
+        "quick-tunnel install page must use its own itms-services URL, got {install_page}"
+    );
+    assert!(
+        !install_page.contains("example.ts.net"),
+        "quick-tunnel install page must not reuse the Tailscale origin, got {install_page}"
+    );
+
+    let tailscale_manifest = client
+        .get(server.url(&format!("/api/v1/artifacts/{artifact_id}/manifest.plist")))
+        .header(HOST, "mbp.example.ts.net")
+        .send()
+        .await
+        .expect("request tailscale manifest")
+        .text()
+        .await
+        .expect("read tailscale manifest");
+    assert!(
+        tailscale_manifest.contains(&format!(
+            "{tailscale}/api/v1/artifacts/{artifact_id}/download.ipa"
+        )),
+        "tailscale manifest must advertise its own IPA URL, got {tailscale_manifest}"
+    );
+    assert!(
+        !tailscale_manifest.contains("trycloudflare.com"),
+        "tailscale manifest must not reuse the Quick Tunnel origin, got {tailscale_manifest}"
+    );
 }
 
 #[tokio::test]
