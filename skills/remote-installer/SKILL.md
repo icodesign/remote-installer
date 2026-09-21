@@ -29,11 +29,15 @@ only the checks owned by those tools.
 
 ## The one thing that will trip you up
 
-**Without an expiry or download limit, `share` runs until stopped.** Run it as
-a background command when the caller needs to continue other work, and read its
-output — if you run it in the foreground you will wait until the share ends.
-Remote Installer owns the selected tunnel session and closes it when the share
-process stops.
+**Without an expiry or download limit, a foreground `share` runs until
+stopped.** If the install link must remain alive after the current agent command
+or turn ends, use the CLI's `--background` mode with `--expire-after` or
+`--timeout`. It registers the native worker with launchd and returns only after
+the origin and tunnel are ready. Do not treat `&`, `nohup`, or a temporary tool
+session as durable background execution.
+
+Remote Installer owns the selected tunnel session and closes it when the
+foreground process or managed background worker stops.
 
 The link is alive only while the process is. Don't stop it after reading the
 URL; it needs to stay up while the phone downloads. Use `--timeout` so it can
@@ -112,12 +116,24 @@ If automatic discovery fails, pass `--apkanalyzer-bin` and `--apksigner-bin`.
 
 ## Running it
 
-Run it as a long-lived process (background it when the caller needs to
-continue other work):
+Run it in the foreground when the terminal will stay attached for the whole
+share:
 
 ```bash
 remote-installer share /path/to/MyApp.ipa
 ```
+
+For the normal agent workflow, keep the share alive across turns with the
+managed background mode:
+
+```bash
+remote-installer share /path/to/MyApp.ipa \
+  --background --expire-after 30m --json
+```
+
+This also works through `npx --yes @icodesign/remote-installer`. The returned
+JSON contains the share ID and ready install URLs. Do not send a URL before the
+command reports a ready session.
 
 **Set `--timeout` on essentially every run.** It takes plain seconds and shuts
 the whole thing down when it elapses — tunnel closed, temporary copy deleted.
@@ -193,7 +209,9 @@ it in your reply — say it's in their terminal and to scan it with the phone
 camera app. If they're working from a different machine than the one running
 the command, the URL is what they need.
 
-Mention in the same breath that the link dies when the command stops.
+For a foreground share, mention that the link dies when the command stops. For
+a background share, mention its expiry instead; the short launcher command has
+already exited by design.
 
 ## While it runs
 
@@ -205,12 +223,21 @@ Download complete: MyApp.ipa (214.6 MB in 38s)
 Download interrupted: MyApp.ipa at 62% (133.1 MB / 214.6 MB)
 ```
 
-If the user asks whether it worked, read the background output rather than
-guessing. Silence means the phone hasn't started downloading — usually that the
-page hasn't been opened yet, not that anything is broken.
+If the user asks whether it worked, inspect the managed session rather than
+guessing:
+
+```bash
+remote-installer status <share-id>
+remote-installer logs <share-id>
+```
+
+Silence in the logs means the phone hasn't started downloading — usually that
+the page hasn't been opened yet, not that anything is broken.
 
 To stop, send Ctrl-C to the `share` process. It owns tunnel cleanup, so the
 selected Tailscale Serve/Funnel session or Cloudflare process closes with it.
+Stop a managed share with `remote-installer stop <share-id>` so launchd sends a
+graceful termination signal and closes the worker's tunnels.
 
 ## When validation fails
 

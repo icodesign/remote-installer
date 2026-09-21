@@ -15,6 +15,8 @@ use remote_installer::service::{ShareConfig, ShareService};
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
+mod background;
+
 const TUNNEL_STARTUP_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 const BUILD_PREPARATION_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -34,6 +36,12 @@ enum Command {
     /// Share one IPA, signed iOS .app, or signed standalone APK.
     #[command(after_help = SHARE_EXAMPLES)]
     Share(ShareArgs),
+    /// Show whether a background share is still running.
+    Status(SessionArgs),
+    /// Print the saved stdout and stderr for a background share.
+    Logs(SessionIdArgs),
+    /// Stop a background share and close its tunnels.
+    Stop(SessionArgs),
 }
 
 const SHARE_EXAMPLES: &str = "\
@@ -55,6 +63,9 @@ Examples:
 
   # Share a signed standalone Android APK
   remote-installer share MyApp.apk
+
+  # Keep sharing after this terminal or agent command exits
+  remote-installer share MyApp.ipa --background --expire-after 30m
 ";
 
 #[derive(Debug, Args)]
@@ -112,6 +123,30 @@ struct ShareArgs {
     /// Loopback address for the temporary origin server.
     #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:0")]
     listen: SocketAddr,
+    /// Run as a launchd-managed macOS background share.
+    #[arg(long)]
+    background: bool,
+    /// Print the ready background session as JSON.
+    #[arg(long, requires = "background")]
+    json: bool,
+    /// Internal state directory supplied to the launchd worker.
+    #[arg(long, hide = true, conflicts_with = "background")]
+    managed_session: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct SessionIdArgs {
+    /// Background share ID printed by `share --background`.
+    id: String,
+}
+
+#[derive(Debug, Args)]
+struct SessionArgs {
+    /// Background share ID printed by `share --background`.
+    id: String,
+    /// Print machine-readable JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 impl ShareArgs {
@@ -137,6 +172,17 @@ enum ShareProvider {
     Cloudflare,
 }
 
+impl ShareProvider {
+    fn cli_name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::TailscaleServe => "tailscale-serve",
+            Self::TailscaleFunnel => "tailscale-funnel",
+            Self::Cloudflare => "cloudflare",
+        }
+    }
+}
+
 impl From<ShareProvider> for ExposureProvider {
     fn from(value: ShareProvider) -> Self {
         match value {
@@ -159,7 +205,10 @@ async fn main() -> ExitCode {
         .with_target(false)
         .init();
     let result = match Cli::parse().command {
-        Command::Share(args) => share(args).await,
+        Command::Share(args) => run_share(args).await,
+        Command::Status(args) => background::status(&args.id, args.json),
+        Command::Logs(args) => background::logs(&args.id),
+        Command::Stop(args) => background::stop(&args.id, args.json).await,
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -168,6 +217,27 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+async fn run_share(args: ShareArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if args.background {
+        return background::start(args).await;
+    }
+
+    let managed_session = args.managed_session.clone();
+    if let Some(directory) = managed_session.as_deref() {
+        background::record_worker_started(directory)?;
+    }
+    let result = share(args).await;
+    if let Some(directory) = managed_session.as_deref()
+        && let Err(state_error) = background::record_worker_finished(
+            directory,
+            result.as_ref().err().map(|error| error.as_ref()),
+        )
+    {
+        tracing::error!(%state_error, "failed to update background share state");
+    }
+    result
 }
 
 /// Print a failure using `Display`, not `Debug`.
@@ -327,6 +397,27 @@ async fn share(args: ShareArgs) -> Result<(), Box<dyn std::error::Error + Send +
         }
     };
     print_share_banners(&artifact, &links, &args);
+    if let Some(directory) = args.managed_session.as_deref() {
+        let ready_links = links
+            .iter()
+            .map(|link| background::ReadyLink {
+                tunnel: link.provider.name().to_owned(),
+                access: access_scope(link.provider).to_owned(),
+                install_page: link.install_page_url.clone(),
+                install_link: link.install_action_url.clone(),
+            })
+            .collect();
+        if let Err(error) = background::record_ready(
+            directory,
+            artifact.title(),
+            local_address,
+            args.artifact_ttl(),
+            ready_links,
+        ) {
+            stop_exposures(&mut exposures).await;
+            return Err(error);
+        }
+    }
 
     let state = HttpState {
         service: Arc::clone(&service),
@@ -628,7 +719,7 @@ async fn wait_for_shutdown(service: Arc<ShareService>) {
         reason
     };
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => println!("\nStopping..."),
+        signal = wait_for_termination_signal() => println!("\n{signal} — stopping..."),
         reason = automatic_shutdown => {
             let cause = match reason {
                 Availability::Expired => "Share expired",
@@ -639,11 +730,27 @@ async fn wait_for_shutdown(service: Arc<ShareService>) {
         }
     }
     tokio::spawn(async {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            eprintln!("\nInterrupted again — exiting without finishing in-flight downloads.");
-            std::process::exit(130);
-        }
+        let signal = wait_for_termination_signal().await;
+        eprintln!("\n{signal} received again — exiting without finishing in-flight downloads.");
+        std::process::exit(130);
     });
+}
+
+#[cfg(unix)]
+async fn wait_for_termination_signal() -> &'static str {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "Interrupted",
+        _ = terminate.recv() => "SIGTERM received",
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_termination_signal() -> &'static str {
+    let _ = tokio::signal::ctrl_c().await;
+    "Interrupted"
 }
 
 fn print_share_banners(artifact: &Artifact, links: &[ProviderLink], args: &ShareArgs) {
@@ -809,7 +916,9 @@ mod tests {
     #[test]
     fn share_defaults_to_auto_provider_discovery() {
         let cli = Cli::try_parse_from(["remote-installer", "share", "Example.ipa"]).unwrap();
-        let Command::Share(args) = cli.command;
+        let Command::Share(args) = cli.command else {
+            panic!("share command")
+        };
         assert!(matches!(args.provider, ShareProvider::Auto));
         let plans = provider_plans(&args);
         assert_eq!(
@@ -847,7 +956,9 @@ mod tests {
                 value,
             ])
             .unwrap();
-            let Command::Share(args) = cli.command;
+            let Command::Share(args) = cli.command else {
+                panic!("share command")
+            };
             assert_eq!(ExposureProvider::from(args.provider), expected);
         }
     }
@@ -892,7 +1003,9 @@ mod tests {
             "/sdk/build-tools/36.0.0/apksigner",
         ])
         .unwrap();
-        let Command::Share(args) = cli.command;
+        let Command::Share(args) = cli.command else {
+            panic!("share command")
+        };
         assert_eq!(
             args.apkanalyzer_bin.as_deref(),
             Some(std::path::Path::new(
@@ -923,7 +1036,9 @@ mod tests {
     fn share_args(arguments: &[&str]) -> ShareArgs {
         let mut full = vec!["remote-installer", "share", "Example.ipa"];
         full.extend_from_slice(arguments);
-        let Command::Share(args) = Cli::try_parse_from(full).unwrap().command;
+        let Command::Share(args) = Cli::try_parse_from(full).unwrap().command else {
+            panic!("share command")
+        };
         args
     }
 
