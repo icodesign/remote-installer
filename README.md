@@ -122,6 +122,32 @@ remote-installer share MyApp.ipa --max-downloads 1 --expire-after 1h
 
 The command exits when either limit is reached, after allowing an active download to finish. After the successful-download limit is reached, it keeps transfer status available for five seconds before closing the tunnel. New download attempts are already blocked during that interval. If the share closes while the page is open, the page directs you to check your device instead of assuming installation failed.
 
+### Keep sharing after an agent command exits
+
+On macOS, `--background` registers the native worker with `launchd`, waits for
+the origin and tunnel to become ready, and then returns the install URL. This
+keeps the share alive when an AI agent finishes its command or turn. A bounded
+expiry is required:
+
+```bash
+npx --yes @icodesign/remote-installer share MyApp.ipa \
+  --background --expire-after 30m --json
+```
+
+The `npx` launcher only starts the operation. The native worker is the process
+owned by `launchd`, so it does not depend on Node.js or the invoking terminal
+after startup. Use the printed share ID to inspect or stop it:
+
+```bash
+remote-installer status <share-id>
+remote-installer logs <share-id>
+remote-installer stop <share-id>
+```
+
+Do not substitute `&`, `nohup`, or an agent tool's temporary command session
+when the link must survive that session. Those mechanisms do not establish the
+same lifecycle ownership.
+
 ### Useful options
 
 | Option                        | Purpose                                                                                                       |
@@ -129,6 +155,8 @@ The command exits when either limit is reached, after allowing an active downloa
 | `--expire-after 30m`          | Stop sharing after a duration                                                                                 |
 | `--timeout 300`               | Stop sharing after a number of seconds                                                                        |
 | `--max-downloads 3`           | Stop after a number of successful downloads                                                                   |
+| `--background`                | Keep a bounded share alive through a launchd-managed native worker                                             |
+| `--json`                      | Print machine-readable background session details; requires `--background`                                   |
 | `--no-qr`                     | Do not print the terminal QR code                                                                             |
 | `--provider auto` (default)   | Detect and start every installed provider                                                                     |
 | `--provider tailscale-serve`  | Keep the link private to your tailnet                                                                         |

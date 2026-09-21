@@ -8,6 +8,19 @@ npx --yes @icodesign/remote-installer share /path/to/MyApp.ipa
 npx --yes @icodesign/remote-installer share /path/to/MyApp.apk
 ```
 
+To keep the link alive after an AI agent command or turn exits, use the
+launchd-managed background mode with a finite expiry:
+
+```bash
+npx --yes @icodesign/remote-installer share /path/to/MyApp.ipa \
+  --background --expire-after 30m --json
+```
+
+The ready result includes a share ID. The same `npx --yes
+@icodesign/remote-installer` prefix can be used with `status <id>`, `logs <id>`,
+and `stop <id>`. Once startup completes, the native worker no longer depends on
+Node.js or the invoking terminal.
+
 By default, the command detects the Tailscale and cloudflared CLIs and starts
 every provider available on this Mac in parallel. It warns about providers that
 are unavailable or not ready. To keep the install page private to the tailnet,
