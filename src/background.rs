@@ -631,7 +631,7 @@ mod tests {
         args.background = false;
         args.no_qr = true;
         args.managed_session = Some(directory.to_owned());
-        args
+        *args
     }
 
     fn state() -> SessionState {
@@ -743,7 +743,7 @@ mod tests {
         else {
             panic!("share command")
         };
-        let error = start(args).await.unwrap_err().to_string();
+        let error = start(*args).await.unwrap_err().to_string();
         assert!(
             error.contains("requires --expire-after or --timeout"),
             "{error}"

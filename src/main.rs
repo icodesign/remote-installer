@@ -37,7 +37,7 @@ struct Cli {
 enum Command {
     /// Share one IPA, signed iOS .app, or signed standalone APK.
     #[command(after_help = SHARE_EXAMPLES)]
-    Share(ShareArgs),
+    Share(Box<ShareArgs>),
     /// Show whether a background share is still running.
     Status(SessionArgs),
     /// Print the saved stdout and stderr for a background share.
@@ -206,7 +206,7 @@ async fn main() -> ExitCode {
         .with_target(false)
         .init();
     let result = match Cli::parse().command {
-        Command::Share(args) => run_share(args).await,
+        Command::Share(args) => run_share(*args).await,
         Command::Status(args) => background::status(&args.id, args.json),
         Command::Logs(args) => background::logs(&args.id),
         Command::Stop(args) => background::stop(&args.id, args.json).await,
@@ -1055,7 +1055,7 @@ mod tests {
         let Command::Share(args) = Cli::try_parse_from(full).unwrap().command else {
             panic!("share command")
         };
-        args
+        *args
     }
 
     #[test]
