@@ -8,7 +8,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use remote_installer::apk::ApkToolchain;
 use remote_installer::artifact_input::{self, PreparationStage, SigningPolicy};
-use remote_installer::exposure::{ExposureProvider, ExposureSession, provider_binary_available};
+use remote_installer::exposure::{
+    ExposureProvider, ExposureSession, TailscaleStartupCoordinator, provider_binary_available,
+};
 use remote_installer::http::{self, HttpState};
 use remote_installer::model::{Artifact, Availability, PlatformMetadata};
 use remote_installer::service::{ShareConfig, ShareService};
@@ -97,17 +99,16 @@ struct ShareArgs {
     /// not control APK checks.
     #[arg(long)]
     allow_unsigned: bool,
-    /// HTTPS port used by Tailscale Serve or an explicitly selected Funnel.
-    /// Auto mode picks another supported Funnel port; `--funnel-port` remains
-    /// a visible compatibility alias.
+    /// Exact HTTPS port used by Tailscale Serve or an explicitly selected
+    /// Funnel. When omitted, an available port is selected automatically;
+    /// `--funnel-port` remains a visible compatibility alias.
     #[arg(
         long = "https-port",
         visible_alias = "funnel-port",
         value_name = "PORT",
-        default_value_t = 443,
         value_parser = parse_https_port
     )]
-    https_port: u16,
+    https_port: Option<u16>,
     /// Explicit path to the Tailscale CLI.
     #[arg(long, value_name = "PATH")]
     tailscale_bin: Option<PathBuf>,
@@ -274,8 +275,10 @@ async fn share(args: ShareArgs) -> Result<(), Box<dyn std::error::Error + Send +
             }
         }
     }
-    if matches!(args.provider, ShareProvider::TailscaleFunnel) {
-        validate_funnel_port(args.https_port)?;
+    if matches!(args.provider, ShareProvider::TailscaleFunnel)
+        && let Some(port) = args.https_port
+    {
+        validate_funnel_port(port)?;
     }
 
     let is_apk = args
@@ -449,54 +452,16 @@ struct ProviderLink {
     install_action_url: String,
 }
 
-fn provider_plans(args: &ShareArgs) -> Vec<ProviderPlan> {
-    match args.provider {
-        ShareProvider::Auto => vec![
-            ProviderPlan {
-                provider: ExposureProvider::TailscaleServe,
-                https_port: args.https_port,
-            },
-            ProviderPlan {
-                provider: ExposureProvider::TailscaleFunnel,
-                // Serve and Funnel cannot share a Tailscale HTTPS port. Keep
-                // both available in auto mode by selecting another supported
-                // Funnel port; explicit provider selection retains the exact
-                // --https-port value the caller requested.
-                https_port: auto_funnel_port(args.https_port),
-            },
-            ProviderPlan {
-                provider: ExposureProvider::Cloudflare,
-                https_port: args.https_port,
-            },
-        ],
-        ShareProvider::TailscaleServe => vec![ProviderPlan {
-            provider: ExposureProvider::TailscaleServe,
-            https_port: args.https_port,
-        }],
-        ShareProvider::TailscaleFunnel => vec![ProviderPlan {
-            provider: ExposureProvider::TailscaleFunnel,
-            https_port: args.https_port,
-        }],
-        ShareProvider::Cloudflare => vec![ProviderPlan {
-            provider: ExposureProvider::Cloudflare,
-            https_port: args.https_port,
-        }],
-    }
-}
-
-fn auto_funnel_port(serve_port: u16) -> u16 {
-    [443, 8443, 10000]
-        .into_iter()
-        .find(|port| *port != serve_port)
-        .unwrap_or(8443)
-}
-
 async fn start_exposures(
     args: &ShareArgs,
     target: &Url,
 ) -> Result<Vec<ExposureSession>, Box<dyn std::error::Error + Send + Sync>> {
     let auto = matches!(args.provider, ShareProvider::Auto);
-    let mut plans = provider_plans(args);
+    let wants_tailscale = auto
+        || matches!(
+            args.provider,
+            ShareProvider::TailscaleServe | ShareProvider::TailscaleFunnel
+        );
     let tailscale_available = provider_binary_available(
         ExposureProvider::TailscaleServe,
         args.tailscale_bin.as_deref(),
@@ -507,36 +472,85 @@ async fn start_exposures(
         args.tailscale_bin.as_deref(),
         args.cloudflared_bin.as_deref(),
     );
-    let tailscale_ready = if auto && tailscale_available {
-        match ExposureSession::check_tailscale_for_auto(args.tailscale_bin.as_deref()).await {
-            Ok(()) => true,
+    let mut tailscale_coordinator = if wants_tailscale && (tailscale_available || !auto) {
+        match TailscaleStartupCoordinator::acquire(args.tailscale_bin.as_deref()).await {
+            Ok(coordinator) => Some(coordinator),
             Err(error) => {
-                eprintln!(
-                    "Warning: Tailscale is unavailable; skipping Tailscale providers: {error}"
-                );
-                false
+                if auto {
+                    eprintln!(
+                        "Warning: Tailscale is unavailable; skipping Tailscale providers: {error}"
+                    );
+                    None
+                } else {
+                    return Err(format!("Tailscale could not start: {error}").into());
+                }
             }
         }
     } else {
-        false
+        None
     };
 
-    if auto {
-        plans.retain(|plan| {
-            let available = match plan.provider {
-                ExposureProvider::TailscaleServe
-                | ExposureProvider::TailscaleFunnel
-                | ExposureProvider::Tailscale => tailscale_available && tailscale_ready,
-                ExposureProvider::Cloudflare => cloudflare_available,
-            };
-            if !available {
+    let mut plans = Vec::new();
+    match args.provider {
+        ShareProvider::Auto => {
+            if let Some(coordinator) = tailscale_coordinator.as_mut() {
+                // Funnel has only three supported ports. Reserve it first so
+                // Serve, which accepts any valid port, cannot consume the last
+                // scarce Funnel route during a concurrent share.
+                match coordinator.reserve_auto_funnel_port(args.https_port) {
+                    Ok(https_port) => plans.push(ProviderPlan {
+                        provider: ExposureProvider::TailscaleFunnel,
+                        https_port,
+                    }),
+                    Err(error) => eprintln!(
+                        "Warning: Tailscale Funnel could not reserve a port; skipping provider: {error}"
+                    ),
+                }
+                match coordinator.reserve_serve_port(args.https_port) {
+                    Ok(https_port) => plans.push(ProviderPlan {
+                        provider: ExposureProvider::TailscaleServe,
+                        https_port,
+                    }),
+                    Err(error) => eprintln!(
+                        "Warning: Tailscale Serve could not reserve a port; skipping provider: {error}"
+                    ),
+                }
+            } else if !tailscale_available {
                 eprintln!(
-                    "Warning: {} is unavailable or not ready; skipping provider.",
-                    plan.provider.name()
+                    "Warning: Tailscale is unavailable; skipping Tailscale Serve and Funnel."
                 );
             }
-            available
-        });
+            if cloudflare_available {
+                plans.push(ProviderPlan {
+                    provider: ExposureProvider::Cloudflare,
+                    https_port: args.https_port.unwrap_or(443),
+                });
+            } else {
+                eprintln!("Warning: Cloudflare Quick Tunnel is unavailable; skipping provider.");
+            }
+        }
+        ShareProvider::TailscaleServe => {
+            let coordinator = tailscale_coordinator
+                .as_mut()
+                .ok_or("Tailscale CLI was not found")?;
+            plans.push(ProviderPlan {
+                provider: ExposureProvider::TailscaleServe,
+                https_port: coordinator.reserve_serve_port(args.https_port)?,
+            });
+        }
+        ShareProvider::TailscaleFunnel => {
+            let coordinator = tailscale_coordinator
+                .as_mut()
+                .ok_or("Tailscale CLI was not found")?;
+            plans.push(ProviderPlan {
+                provider: ExposureProvider::TailscaleFunnel,
+                https_port: coordinator.reserve_funnel_port(args.https_port)?,
+            });
+        }
+        ShareProvider::Cloudflare => plans.push(ProviderPlan {
+            provider: ExposureProvider::Cloudflare,
+            https_port: args.https_port.unwrap_or(443),
+        }),
     }
     if plans.is_empty() {
         return Err("no supported tunnel provider is available".into());
@@ -546,21 +560,25 @@ async fn start_exposures(
         .iter()
         .map(|plan| plan.provider.name())
         .collect::<Vec<_>>();
+    let tailscale_starts = Arc::new(tokio::sync::Mutex::new(()));
+    let mut tailscale_pending = plans
+        .iter()
+        .filter(|plan| is_tailscale_provider(plan.provider))
+        .count();
     let mut starts = FuturesUnordered::new();
     for plan in plans {
         let provider = plan.provider;
         let tailscale_binary = args.tailscale_bin.as_deref();
         let cloudflared_binary = args.cloudflared_bin.as_deref();
-        let use_shared_tailscale_preflight = auto
-            && tailscale_ready
-            && matches!(
-                provider,
-                ExposureProvider::TailscaleServe
-                    | ExposureProvider::TailscaleFunnel
-                    | ExposureProvider::Tailscale
-            );
+        let coordinated_tailscale_start =
+            tailscale_coordinator.is_some() && is_tailscale_provider(provider);
+        let tailscale_starts = Arc::clone(&tailscale_starts);
         starts.push(async move {
-            let result = if use_shared_tailscale_preflight {
+            let result = if coordinated_tailscale_start {
+                // Tailscale updates one shared ServeConfig with optimistic
+                // concurrency. Serialize this process's Serve/Funnel writes;
+                // the file-backed coordinator serializes other instances.
+                let _serial = tailscale_starts.lock().await;
                 ExposureSession::start_without_configuration_check(
                     provider,
                     target,
@@ -594,6 +612,12 @@ async fn start_exposures(
             biased;
             Some((plan, result)) = starts.next() => {
                 pending.retain(|name| *name != plan.provider.name());
+                if is_tailscale_provider(plan.provider) {
+                    tailscale_pending -= 1;
+                    if tailscale_pending == 0 {
+                        drop(tailscale_coordinator.take());
+                    }
+                }
                 results.push((plan, result));
             }
             _ = tokio::signal::ctrl_c() => {
@@ -626,6 +650,15 @@ async fn start_exposures(
     }
     exposures.sort_by_key(|exposure| provider_order(exposure.provider()));
     Ok(exposures)
+}
+
+fn is_tailscale_provider(provider: ExposureProvider) -> bool {
+    matches!(
+        provider,
+        ExposureProvider::TailscaleServe
+            | ExposureProvider::TailscaleFunnel
+            | ExposureProvider::Tailscale
+    )
 }
 
 fn provider_order(provider: ExposureProvider) -> u8 {
@@ -920,24 +953,7 @@ mod tests {
             panic!("share command")
         };
         assert!(matches!(args.provider, ShareProvider::Auto));
-        let plans = provider_plans(&args);
-        assert_eq!(
-            plans.iter().map(|plan| plan.provider).collect::<Vec<_>>(),
-            vec![
-                ExposureProvider::TailscaleServe,
-                ExposureProvider::TailscaleFunnel,
-                ExposureProvider::Cloudflare,
-            ]
-        );
-        assert_eq!(plans[0].https_port, 443);
-        assert_eq!(plans[1].https_port, 8443);
-    }
-
-    #[test]
-    fn auto_funnel_port_avoids_the_serve_port() {
-        assert_eq!(auto_funnel_port(443), 8443);
-        assert_eq!(auto_funnel_port(8443), 443);
-        assert_eq!(auto_funnel_port(10000), 443);
+        assert_eq!(args.https_port, None);
     }
 
     #[test]
@@ -983,11 +999,11 @@ mod tests {
     fn https_port_and_funnel_port_alias_share_one_argument() {
         assert_eq!(
             share_args(&["--provider", "tailscale-serve", "--https-port", "8080"]).https_port,
-            8080
+            Some(8080)
         );
         assert_eq!(
             share_args(&["--provider", "tailscale-funnel", "--funnel-port", "8443"]).https_port,
-            8443
+            Some(8443)
         );
     }
 

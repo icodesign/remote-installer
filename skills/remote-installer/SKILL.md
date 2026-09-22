@@ -3,7 +3,8 @@ name: remote-installer
 description: >-
   Put an iOS or Android build on a real phone or tablet over the air with the
   `remote-installer` CLI — it validates the build, opens a temporary HTTPS
-  tunnel, and prints an install URL plus a QR code to scan. Use this whenever
+  tunnel, and prints one or more install URLs plus QR codes to scan. Use this
+  whenever
   someone wants a build onto a physical device without TestFlight or a cable:
   "get this on my phone", "send this build to a tester", "share the IPA or APK",
   "install this on my iPad", "let QA try this build", "make a link for this
@@ -16,10 +17,11 @@ description: >-
 
 # Sharing a mobile build over the air
 
-`remote-installer share <build>` validates an iOS or Android build, stands up a
-temporary HTTPS tunnel in front of a loopback server, and prints an install
-page URL plus a QR code. iOS uses `itms-services://`; Android downloads a signed
-standalone APK for the system installer. Stopping the process kills the link.
+`remote-installer share <build>` validates an iOS or Android build, stands up
+temporary HTTPS tunnels in front of a loopback server, and prints an install
+page URL plus a QR code for every provider that becomes ready. iOS uses
+`itms-services://`; Android downloads a signed standalone APK for the system
+installer. Stopping the process kills the links.
 
 The published CLI is currently macOS only. iOS `.app` handling shells out to
 Apple system tools. APK handling uses Android SDK `apkanalyzer` and `apksigner`
@@ -102,14 +104,16 @@ a source checkout or binary path.
 `cloudflared` (`brew install cloudflared`) and Tailscale (`brew install
 --cask tailscale`), starts every provider that is available, and warns about
 the rest. No Cloudflare account is needed for the Quick Tunnel. Select one
-provider explicitly when you need only that route. Auto mode may print several
-working links; they are alternate origins for one staged artifact, one download
-quota, and one lifecycle rather than separate copies.
+provider explicitly only when the user requests it or an access requirement
+calls for one route. Otherwise keep the default auto mode. Auto mode may print
+several working links; they are alternate origins for one staged artifact, one
+download quota, and one lifecycle rather than separate copies.
 
-Remote Installer refuses to replace an existing Tailscale Serve or Funnel
-configuration. Auto mode warns and skips Tailscale while another available
-provider can continue; an explicitly selected Tailscale provider reports the
-conflict and stops. Do not reset the user's existing configuration to force it.
+Remote Installer preserves existing Tailscale Serve and Funnel routes. When
+`--https-port` is omitted, concurrent shares reserve different available ports
+on the node. An explicitly requested occupied port reports the conflict instead
+of replacing its route. Do not reset the user's existing configuration to
+force it.
 
 For APKs, ensure Android SDK Command-Line Tools and Build Tools are installed.
 If automatic discovery fails, pass `--apkanalyzer-bin` and `--apksigner-bin`.
@@ -132,8 +136,9 @@ remote-installer share /path/to/MyApp.ipa \
 ```
 
 This also works through `npx --yes @icodesign/remote-installer`. The returned
-JSON contains the share ID and ready install URLs. Do not send a URL before the
-command reports a ready session.
+JSON contains the share ID and a `links` array of ready provider results. Do not
+send any URL before the command reports a ready session, and do not collapse
+that array to its first entry.
 
 **Set `--timeout` on essentially every run.** It takes plain seconds and shuts
 the whole thing down when it elapses — tunnel closed, temporary copy deleted.
@@ -171,8 +176,8 @@ writing a command a human will read. Passing both is an error, so pick one.
 Other flags worth knowing: `--provider tailscale-serve` (private to the
 tailnet), `--provider tailscale-funnel` (public through Tailscale), and
 `--provider tailscale` (the compatibility alias for Funnel), `--https-port`
-(the Serve port in auto mode; `--funnel-port` is its visible compatibility
-alias), `--no-qr`,
+(require an exact Tailscale port instead of automatic allocation;
+`--funnel-port` is its visible compatibility alias), `--no-qr`,
 `--cloudflared-bin`, and `--tailscale-bin`.
 
 ## Reading the output
@@ -201,8 +206,22 @@ provider is reported as a warning while the other links remain usable. Read the
 For Android, `Requires` contains an API level and `Install link` is the granted
 HTTPS `download.apk` URL. Give the user the install page in either case.
 
-Give the user the **Install page** URL. That's the one to open on the phone and
-the one to paste into a message.
+Return **every ready Install page URL** to the user, not just the first or a
+preferred provider. Label each URL with its provider and access scope (`Public
+internet` or `Tailnet only`) so the user can choose which route to open. A
+provider warning is not a reason to omit the other successful links. If only
+one provider becomes ready, return that one and briefly mention that it was the
+only available route.
+
+The **Install page** URLs are the ones to open on the phone and paste into a
+message. Do not substitute the native `Install link` values. A concise reply
+with multiple results can look like:
+
+```text
+- Cloudflare Quick Tunnel (Public internet): https://.../install/...
+- Tailscale Serve (Tailnet only): https://.../install/...
+- Tailscale Funnel (Public internet): https://.../install/...
+```
 
 The QR code is terminal art printed below that banner. Don't try to reproduce
 it in your reply — say it's in their terminal and to scan it with the phone
@@ -223,8 +242,8 @@ Download complete: MyApp.ipa (214.6 MB in 38s)
 Download interrupted: MyApp.ipa at 62% (133.1 MB / 214.6 MB)
 ```
 
-If the user asks whether it worked, inspect the managed session rather than
-guessing:
+If the user asks whether it worked or asks for the links again, inspect the
+managed session rather than guessing, and return every ready provider link:
 
 ```bash
 remote-installer status <share-id>
