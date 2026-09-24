@@ -308,8 +308,6 @@ fn worker_arguments(args: &ShareArgs, executable: String) -> Vec<String> {
             .to_string(),
         "--provider".to_owned(),
         args.provider.cli_name().to_owned(),
-        "--https-port".to_owned(),
-        args.https_port.to_string(),
         "--listen".to_owned(),
         args.listen.to_string(),
         "--no-qr".to_owned(),
@@ -320,6 +318,9 @@ fn worker_arguments(args: &ShareArgs, executable: String) -> Vec<String> {
             .display()
             .to_string(),
     ];
+    if let Some(port) = args.https_port {
+        result.extend(["--https-port".to_owned(), port.to_string()]);
+    }
     if let Some(maximum) = args.max_downloads {
         result.extend(["--max-downloads".to_owned(), maximum.to_string()]);
     }
@@ -630,7 +631,7 @@ mod tests {
         args.background = false;
         args.no_qr = true;
         args.managed_session = Some(directory.to_owned());
-        args
+        *args
     }
 
     fn state() -> SessionState {
@@ -716,6 +717,12 @@ mod tests {
         assert!(joined.contains("--max-downloads 1"), "{joined}");
         assert!(joined.contains("--provider tailscale-serve"), "{joined}");
         assert!(joined.contains("--no-qr"), "{joined}");
+        assert!(!joined.contains("--https-port"), "{joined}");
+
+        let mut explicit = background_args(temporary.path());
+        explicit.https_port = Some(10001);
+        let joined = worker_arguments(&explicit, "/native/remote-installer".to_owned()).join(" ");
+        assert!(joined.contains("--https-port 10001"), "{joined}");
     }
 
     #[test]
@@ -736,7 +743,7 @@ mod tests {
         else {
             panic!("share command")
         };
-        let error = start(args).await.unwrap_err().to_string();
+        let error = start(*args).await.unwrap_err().to_string();
         assert!(
             error.contains("requires --expire-after or --timeout"),
             "{error}"

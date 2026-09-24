@@ -161,13 +161,13 @@ same lifecycle ownership.
 | `--provider auto` (default)   | Detect and start every installed provider                                                                     |
 | `--provider tailscale-serve`  | Keep the link private to your tailnet                                                                         |
 | `--provider tailscale-funnel` | Create a public Tailscale link                                                                                |
-| `--https-port PORT`           | Tailscale Serve port; auto mode picks another supported Funnel port; `--funnel-port` is a compatibility alias |
+| `--https-port PORT`           | Require an exact Tailscale HTTPS port; when omitted, select an available port; `--funnel-port` is a compatibility alias |
 
 Use either `--expire-after` or `--timeout`, not both. Run `remote-installer share --help` for every option.
 
-With the default `--provider auto`, Remote Installer checks for the Tailscale and cloudflared CLIs, starts every provider it can use in parallel, and prints a warning for each unavailable or unready provider. Tailscale Serve and Funnel use different HTTPS ports automatically so both can run in the same share. If you select one provider explicitly, only that provider is started. The terminal labels every result as `Public internet` or `Tailnet only` so the access boundary is visible next to the URL.
+With the default `--provider auto`, Remote Installer checks for the Tailscale and cloudflared CLIs, starts every provider it can use, and prints a warning for each unavailable or unready provider. Tailscale Serve and Funnel use different HTTPS ports automatically so both can run in the same share. Tailscale configuration writes are serialized while Cloudflare starts independently. If you select one provider explicitly, only that provider is started. The terminal labels every result as `Public internet` or `Tailnet only` so the access boundary is visible next to the URL.
 
-Remote Installer does not overwrite an existing Tailscale Serve or Funnel configuration. Auto mode warns and skips Tailscale while another available provider can continue; explicitly selecting the conflicting Tailscale mode returns an error.
+Remote Installer does not overwrite existing Tailscale Serve or Funnel routes. When `--https-port` is omitted, concurrent shares reserve different available ports on the node. An explicitly requested occupied port returns an error instead of replacing its route. Stopping a share closes only the foreground sessions owned by that process; it never runs a global `serve reset`.
 
 Tailscale Serve requires the phone to be on the same tailnet (or otherwise allowed by its access policy). Tailscale Funnel creates a public link and does not require Tailscale on the phone. The older `--provider tailscale` spelling is kept as an alias for `tailscale-funnel`; use the explicit provider name in new commands.
 

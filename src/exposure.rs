@@ -1,4 +1,5 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
@@ -18,6 +19,9 @@ use url::Url;
 const TAILSCALE_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 const TAILSCALE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const TAILSCALE_DNS_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+const TAILSCALE_COORDINATION_TIMEOUT: Duration = Duration::from_secs(300);
+const TAILSCALE_COORDINATION_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const TAILSCALE_COORDINATION_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
 const TAILSCALE_APP_CLI: &str = "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
 const CLOUDFLARED_HOMEBREW_CLI: &str = "/opt/homebrew/bin/cloudflared";
@@ -107,12 +111,26 @@ pub enum ExposureError {
     },
     #[error("tunnel process I/O failed: {0}")]
     Io(#[from] std::io::Error),
-    #[error("Tailscale returned invalid JSON: {0}")]
-    Json(#[from] serde_json::Error),
+    #[error(
+        "Tailscale command `{command}` returned invalid JSON: {source}; stdout: {stdout}; stderr: {stderr}"
+    )]
+    Json {
+        command: String,
+        stdout: String,
+        stderr: String,
+        #[source]
+        source: serde_json::Error,
+    },
     #[error("Tailscale is not ready: {0}")]
     TailscaleNotReady(String),
-    #[error("an existing Tailscale {mode} configuration is active; refusing to replace it")]
-    ExistingTailscaleConfiguration { mode: &'static str },
+    #[error(
+        "Tailscale HTTPS port {port} is already in use; omit --https-port to select another port automatically"
+    )]
+    TailscalePortInUse { port: u16 },
+    #[error("no available Tailscale {mode} HTTPS port was found")]
+    NoTailscalePortAvailable { mode: &'static str },
+    #[error("could not coordinate Tailscale startup: {0}")]
+    TailscaleCoordination(String),
     #[error("Tailscale {mode} requires a valid HTTPS port, got {port}")]
     InvalidTailscalePort { mode: &'static str, port: u16 },
     #[error("{program} failed: {message}")]
@@ -141,6 +159,18 @@ pub struct ExposureSession {
     public_base_url: Url,
     warnings: Vec<String>,
     inner: ExposureSessionInner,
+}
+
+/// Serializes Tailscale configuration changes made by remote-installer
+/// processes on this Mac and reserves non-overlapping node HTTPS ports.
+///
+/// Tailscale owns one per-node ServeConfig that can contain many foreground
+/// sessions. Holding this coordinator until the planned Tailscale children are
+/// ready prevents two remote-installer processes from selecting the same port
+/// from the same configuration snapshot.
+pub struct TailscaleStartupCoordinator {
+    _lock: File,
+    occupied_ports: BTreeSet<u16>,
 }
 
 enum ExposureSessionInner {
@@ -215,10 +245,8 @@ impl ExposureSession {
         .await
     }
 
-    /// Start a provider after the caller has performed one shared Tailscale
-    /// preflight. Auto mode uses this for its parallel Serve/Funnel starts so
-    /// the second child does not mistake the first child that this same command
-    /// just created for a pre-existing user configuration.
+    /// Start a provider after the caller has acquired the shared Tailscale
+    /// startup coordinator and reserved a non-overlapping HTTPS port.
     pub async fn start_without_configuration_check(
         provider: ExposureProvider,
         target: &Url,
@@ -265,39 +293,6 @@ impl ExposureSession {
         }
     }
 
-    /// Check that the Tailscale CLI can serve this process and that no
-    /// existing Serve/Funnel configuration would be overwritten by auto mode.
-    pub async fn check_tailscale_for_auto(
-        binary_override: Option<&Path>,
-    ) -> Result<(), ExposureError> {
-        let binary = discover_binary(
-            "Tailscale",
-            "tailscale",
-            binary_override,
-            &[TAILSCALE_APP_CLI],
-            TAILSCALE_INSTALL_HINT,
-        )?;
-        let status: TailscaleStatus = command_json(&binary, &["status", "--json"]).await?;
-        if status.backend_state != "Running" {
-            return Err(ExposureError::TailscaleNotReady(format!(
-                "backend state is {}",
-                status.backend_state
-            )));
-        }
-        status
-            .self_node
-            .and_then(|node| node.dns_name)
-            .filter(|name| !name.trim_matches('.').is_empty())
-            .ok_or_else(|| {
-                ExposureError::TailscaleNotReady("the current node has no MagicDNS name".into())
-            })?;
-        // Check both modes before either child is spawned. Serve and Funnel
-        // keep separate foreground entries, so checking only Serve could let
-        // auto mode overwrite a user's existing Funnel configuration.
-        ensure_empty_tailscale_configuration(&binary, TailscaleMode::Serve).await?;
-        ensure_empty_tailscale_configuration(&binary, TailscaleMode::Funnel).await
-    }
-
     pub fn provider(&self) -> ExposureProvider {
         self.provider
     }
@@ -322,6 +317,86 @@ impl ExposureSession {
             ExposureSessionInner::Tailscale(session) => session.stop().await,
             ExposureSessionInner::Cloudflare(session) => session.stop().await,
         }
+    }
+}
+
+impl TailscaleStartupCoordinator {
+    /// Acquire the per-user startup lock and snapshot the node ports already
+    /// owned by foreground or background Serve/Funnel configurations.
+    pub async fn acquire(binary_override: Option<&Path>) -> Result<Self, ExposureError> {
+        let lock = acquire_tailscale_startup_lock().await?;
+        let binary = discover_binary(
+            "Tailscale",
+            "tailscale",
+            binary_override,
+            &[TAILSCALE_APP_CLI],
+            TAILSCALE_INSTALL_HINT,
+        )?;
+        tailscale_dns_name(&binary).await?;
+        let occupied_ports = tailscale_ports_in_use(&binary).await?;
+        Ok(Self {
+            _lock: lock,
+            occupied_ports,
+        })
+    }
+
+    /// Reserve a Serve port. An explicit request is strict; an omitted port
+    /// prefers the conventional ports, then moves into a stable high range.
+    pub fn reserve_serve_port(&mut self, requested: Option<u16>) -> Result<u16, ExposureError> {
+        self.reserve_port(TailscaleMode::Serve, requested, &[443, 8443, 10000])
+    }
+
+    /// Reserve a Funnel port. Funnel only supports its three public ports.
+    pub fn reserve_funnel_port(&mut self, requested: Option<u16>) -> Result<u16, ExposureError> {
+        self.reserve_port(TailscaleMode::Funnel, requested, &[443, 8443, 10000])
+    }
+
+    /// Auto mode prefers 8443 for Funnel so the ordinary Serve URL can retain
+    /// 443. The explicitly requested Serve port is excluded from consideration.
+    pub fn reserve_auto_funnel_port(
+        &mut self,
+        requested_serve_port: Option<u16>,
+    ) -> Result<u16, ExposureError> {
+        let candidates = [8443, 10000, 443];
+        let port = candidates
+            .into_iter()
+            .find(|port| Some(*port) != requested_serve_port && !self.occupied_ports.contains(port))
+            .ok_or(ExposureError::NoTailscalePortAvailable {
+                mode: TailscaleMode::Funnel.display_name(),
+            })?;
+        self.occupied_ports.insert(port);
+        Ok(port)
+    }
+
+    fn reserve_port(
+        &mut self,
+        mode: TailscaleMode,
+        requested: Option<u16>,
+        preferred: &[u16],
+    ) -> Result<u16, ExposureError> {
+        if let Some(port) = requested {
+            validate_tailscale_port(mode, port)?;
+            if !self.occupied_ports.insert(port) {
+                return Err(ExposureError::TailscalePortInUse { port });
+            }
+            return Ok(port);
+        }
+
+        let candidate = preferred
+            .iter()
+            .copied()
+            .find(|port| !self.occupied_ports.contains(port))
+            .or_else(|| {
+                (mode == TailscaleMode::Serve)
+                    .then(|| (10001..=u16::MAX).find(|port| !self.occupied_ports.contains(port)))
+                    .flatten()
+            })
+            .ok_or(ExposureError::NoTailscalePortAvailable {
+                mode: mode.display_name(),
+            })?;
+        validate_tailscale_port(mode, candidate)?;
+        self.occupied_ports.insert(candidate);
+        Ok(candidate)
     }
 }
 
@@ -438,22 +513,9 @@ async fn start_tailscale(
         &[TAILSCALE_APP_CLI],
         TAILSCALE_INSTALL_HINT,
     )?;
-    let status: TailscaleStatus = command_json(&binary, &["status", "--json"]).await?;
-    if status.backend_state != "Running" {
-        return Err(ExposureError::TailscaleNotReady(format!(
-            "backend state is {}",
-            status.backend_state
-        )));
-    }
-    let dns_name = status
-        .self_node
-        .and_then(|node| node.dns_name)
-        .filter(|name| !name.trim_matches('.').is_empty())
-        .ok_or_else(|| {
-            ExposureError::TailscaleNotReady("the current node has no MagicDNS name".into())
-        })?;
+    let dns_name = tailscale_dns_name(&binary).await?;
     if check_existing_tailscale_configuration {
-        ensure_empty_tailscale_configuration(&binary, mode).await?;
+        ensure_tailscale_port_available(&binary, https_port).await?;
     }
     let warnings = tailscale_dns_diagnostics(&binary, mode).await?;
 
@@ -671,18 +733,106 @@ async fn start_cloudflare_once(
     )))
 }
 
-async fn ensure_empty_tailscale_configuration(
-    binary: &Path,
-    mode: TailscaleMode,
-) -> Result<(), ExposureError> {
-    let current: Value = command_json(binary, &[mode.command(), "status", "--json"]).await?;
-    if empty_configuration(&current) {
-        Ok(())
-    } else {
-        Err(ExposureError::ExistingTailscaleConfiguration {
-            mode: mode.display_name(),
-        })
+async fn acquire_tailscale_startup_lock() -> Result<File, ExposureError> {
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| ExposureError::TailscaleCoordination("HOME is not set".to_owned()))?;
+    let directory = PathBuf::from(home)
+        .join("Library")
+        .join("Caches")
+        .join("remote-installer");
+    let file = tokio::task::spawn_blocking(move || {
+        std::fs::create_dir_all(&directory)?;
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(directory.join("tailscale-startup.lock"))
+    })
+    .await
+    .map_err(|error| ExposureError::TailscaleCoordination(error.to_string()))?
+    .map_err(ExposureError::Io)?;
+
+    let started_at = Instant::now();
+    let deadline = started_at + TAILSCALE_COORDINATION_TIMEOUT;
+    let mut next_progress = started_at + TAILSCALE_COORDINATION_PROGRESS_INTERVAL;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(ExposureError::TailscaleCoordination(
+                        "timed out waiting for another remote-installer process to finish configuring Tailscale"
+                            .to_owned(),
+                    ));
+                }
+                if now >= next_progress {
+                    eprintln!(
+                        "Still waiting for another remote-installer process to finish configuring Tailscale... ({}s elapsed)",
+                        started_at.elapsed().as_secs()
+                    );
+                    next_progress += TAILSCALE_COORDINATION_PROGRESS_INTERVAL;
+                }
+                sleep(TAILSCALE_COORDINATION_POLL_INTERVAL).await;
+            }
+            Err(TryLockError::Error(error)) => return Err(ExposureError::Io(error)),
+        }
     }
+}
+
+async fn tailscale_dns_name(binary: &Path) -> Result<String, ExposureError> {
+    let status: TailscaleStatus = command_json(binary, &["status", "--json"]).await?;
+    if status.backend_state != "Running" {
+        return Err(ExposureError::TailscaleNotReady(format!(
+            "backend state is {}",
+            status.backend_state
+        )));
+    }
+    status
+        .self_node
+        .and_then(|node| node.dns_name)
+        .filter(|name| !name.trim_matches('.').is_empty())
+        .ok_or_else(|| {
+            ExposureError::TailscaleNotReady("the current node has no MagicDNS name".into())
+        })
+}
+
+async fn ensure_tailscale_port_available(binary: &Path, port: u16) -> Result<(), ExposureError> {
+    if tailscale_ports_in_use(binary).await?.contains(&port) {
+        Err(ExposureError::TailscalePortInUse { port })
+    } else {
+        Ok(())
+    }
+}
+
+async fn tailscale_ports_in_use(binary: &Path) -> Result<BTreeSet<u16>, ExposureError> {
+    let serve: Value = command_json(binary, &["serve", "status", "--json"]).await?;
+    let funnel: Value = command_json(binary, &["funnel", "status", "--json"]).await?;
+    let mut ports = node_tailscale_ports(&serve);
+    ports.extend(node_tailscale_ports(&funnel));
+    Ok(ports)
+}
+
+/// Collect only node-level and foreground ports. Named Tailscale Services use
+/// distinct virtual IPs, so their endpoint numbers do not collide with this
+/// node's Serve/Funnel listeners.
+fn node_tailscale_ports(configuration: &Value) -> BTreeSet<u16> {
+    fn collect_tcp_ports(configuration: &Value, ports: &mut BTreeSet<u16>) {
+        let Some(tcp) = configuration.get("TCP").and_then(Value::as_object) else {
+            return;
+        };
+        ports.extend(tcp.keys().filter_map(|port| port.parse::<u16>().ok()));
+    }
+
+    let mut ports = BTreeSet::new();
+    collect_tcp_ports(configuration, &mut ports);
+    if let Some(sessions) = configuration.get("Foreground").and_then(Value::as_object) {
+        for session in sessions.values() {
+            collect_tcp_ports(session, &mut ports);
+        }
+    }
+    ports
 }
 
 async fn tailscale_dns_diagnostics(
@@ -801,7 +951,29 @@ async fn command_json<T: serde::de::DeserializeOwned>(
     arguments: &[&str],
 ) -> Result<T, ExposureError> {
     let output = run_checked("Tailscale", binary, arguments).await?;
-    Ok(serde_json::from_slice(&output.stdout)?)
+    serde_json::from_slice(&output.stdout).map_err(|source| ExposureError::Json {
+        command: arguments.join(" "),
+        stdout: command_output_summary(&output.stdout),
+        stderr: command_output_summary(&output.stderr),
+        source,
+    })
+}
+
+fn command_output_summary(output: &[u8]) -> String {
+    const MAX_CHARS: usize = 512;
+
+    if output.is_empty() {
+        return "<empty>".into();
+    }
+
+    let text = String::from_utf8_lossy(output);
+    let mut chars = text.chars();
+    let summary = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{summary:?} (truncated, {} bytes total)", output.len())
+    } else {
+        format!("{summary:?}")
+    }
 }
 
 async fn run_checked(
@@ -828,10 +1000,6 @@ async fn run_checked(
             message
         },
     })
-}
-
-fn empty_configuration(value: &Value) -> bool {
-    matches!(value, Value::Null) || value.as_object().is_some_and(serde_json::Map::is_empty)
 }
 
 fn tailscale_public_url(dns_name: &str, https_port: u16) -> Result<Url, ExposureError> {
@@ -913,10 +1081,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accepts_only_an_empty_tailscale_configuration() {
-        assert!(empty_configuration(&serde_json::json!({})));
-        assert!(empty_configuration(&Value::Null));
-        assert!(!empty_configuration(&serde_json::json!({"TCP":{"443":{}}})));
+    fn finds_node_and_foreground_ports_without_claiming_service_vips() {
+        let ports = node_tailscale_ports(&serde_json::json!({
+            "TCP": {"443": {"HTTPS": true}},
+            "Foreground": {
+                "first": {"TCP": {"8443": {"HTTPS": true}}},
+                "second": {"TCP": {"10000": {"HTTPS": true}}}
+            },
+            "Services": {
+                "svc:other": {"TCP": {"10001": {"HTTPS": true}}}
+            }
+        }));
+        assert_eq!(ports, BTreeSet::from([443, 8443, 10000]));
+    }
+
+    #[test]
+    fn allocates_non_overlapping_ports_for_a_second_auto_share() {
+        let mut coordinator = TailscaleStartupCoordinator {
+            _lock: tempfile::tempfile().unwrap(),
+            occupied_ports: BTreeSet::from([443, 8443]),
+        };
+        assert_eq!(coordinator.reserve_auto_funnel_port(None).unwrap(), 10000);
+        assert_eq!(coordinator.reserve_serve_port(None).unwrap(), 10001);
+    }
+
+    #[test]
+    fn an_explicit_occupied_port_is_not_silently_replaced() {
+        let mut coordinator = TailscaleStartupCoordinator {
+            _lock: tempfile::tempfile().unwrap(),
+            occupied_ports: BTreeSet::from([443]),
+        };
+        let error = coordinator.reserve_serve_port(Some(443)).unwrap_err();
+        assert!(matches!(
+            error,
+            ExposureError::TailscalePortInUse { port: 443 }
+        ));
     }
 
     #[test]
@@ -984,6 +1183,39 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invalid_tailscale_json_reports_the_command_and_bounded_output() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let binary = temporary.path().join("tailscale");
+        let long_output = "x".repeat(600);
+        std::fs::write(
+            &binary,
+            format!("#!/bin/sh\nprintf '%s' '{long_output}'\nprintf '%s' 'diagnostic' >&2\n"),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&binary, permissions).unwrap();
+
+        let error = command_json::<Value>(&binary, &["serve", "status", "--json"])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("`serve status --json`"));
+        assert!(error.contains("expected value at line 1 column 1"));
+        assert!(error.contains("diagnostic"));
+        assert!(error.contains("truncated, 600 bytes total"));
+        assert!(!error.contains(&long_output));
+    }
+
+    #[test]
+    fn empty_command_output_has_an_explicit_summary() {
+        assert_eq!(command_output_summary(b""), "<empty>");
+    }
+
     #[test]
     fn validates_tailscale_port_rules_by_mode() {
         assert!(validate_tailscale_port(TailscaleMode::Serve, 1).is_ok());
@@ -1028,7 +1260,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn auto_preflight_checks_both_tailscale_modes_before_starting() {
+    async fn port_snapshot_checks_both_tailscale_modes() {
         let temporary = tempfile::tempdir().unwrap();
         let binary = temporary.path().join("tailscale");
         let log = temporary.path().join("commands.log");
@@ -1036,14 +1268,14 @@ mod tests {
             &binary,
             &log,
             r#"{"BackendState":"Running","Self":{"DNSName":"mac.example.ts.net."}}"#,
-            "{}",
+            r#"{"Foreground":{"existing":{"TCP":{"443":{"HTTPS":true}}}}}"#,
         );
 
-        ExposureSession::check_tailscale_for_auto(Some(&binary))
-            .await
-            .unwrap();
+        assert_eq!(
+            tailscale_ports_in_use(&binary).await.unwrap(),
+            BTreeSet::from([443])
+        );
         let commands = std::fs::read_to_string(log).unwrap();
-        assert!(commands.contains("status --json"));
         assert!(commands.contains("serve status --json"));
         assert!(commands.contains("funnel status --json"));
     }
@@ -1119,7 +1351,8 @@ mod tests {
         assert!(!commands.contains(" off"));
         assert!(!commands.contains("--bg"));
         assert_fake_child_exited(&binary);
-        assert!(!commands.contains("funnel"));
+        assert!(commands.contains("funnel status --json"));
+        assert!(!commands.contains("funnel --yes"));
         assert!(!commands.contains("reset"));
     }
 
@@ -1328,10 +1561,10 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn refuses_existing_configuration_without_starting_or_resetting_it() {
-        for (provider, mode) in [
-            (ExposureProvider::TailscaleServe, "Serve"),
-            (ExposureProvider::TailscaleFunnel, "Funnel"),
+    async fn refuses_an_occupied_port_without_starting_or_resetting_it() {
+        for provider in [
+            ExposureProvider::TailscaleServe,
+            ExposureProvider::TailscaleFunnel,
         ] {
             let temporary = tempfile::tempdir().unwrap();
             let binary = temporary.path().join("tailscale");
@@ -1346,18 +1579,50 @@ mod tests {
             let error = ExposureSession::start(provider, &target, Some(&binary), None, 443)
                 .await
                 .err()
-                .expect("existing configuration should be refused");
+                .expect("occupied port should be refused");
             assert_eq!(
                 error.to_string(),
-                format!(
-                    "an existing Tailscale {mode} configuration is active; refusing to replace it"
-                )
+                "Tailscale HTTPS port 443 is already in use; omit --https-port to select another port automatically"
             );
             let commands = std::fs::read_to_string(log).unwrap();
-            assert!(commands.contains(&format!("{} status --json", mode.to_lowercase())));
+            assert!(commands.contains("serve status --json"));
+            assert!(commands.contains("funnel status --json"));
             assert!(!commands.contains(" --yes "));
             assert!(!commands.contains("reset"));
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn allows_a_second_serve_session_on_an_unused_port() {
+        let temporary = tempfile::tempdir().unwrap();
+        let binary = temporary.path().join("tailscale");
+        let log = temporary.path().join("commands.log");
+        write_fake_tailscale(
+            &binary,
+            &log,
+            r#"{"BackendState":"Running","Self":{"DNSName":"mac.example.ts.net."}}"#,
+            r#"{"Foreground":{"existing":{"TCP":{"443":{"HTTPS":true}}}}}"#,
+        );
+        let target = Url::parse("http://127.0.0.1:49152").unwrap();
+        let mut session = ExposureSession::start(
+            ExposureProvider::TailscaleServe,
+            &target,
+            Some(&binary),
+            None,
+            10001,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            session.public_base_url().as_str(),
+            "https://mac.example.ts.net:10001/"
+        );
+        session.stop().await.unwrap();
+
+        let commands = std::fs::read_to_string(log).unwrap();
+        assert!(commands.contains("serve --yes --https=10001"));
+        assert!(!commands.contains("reset"));
     }
 
     #[cfg(unix)]
